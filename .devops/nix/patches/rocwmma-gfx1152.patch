@@ -1,0 +1,77 @@
+--- a/library/include/rocwmma/internal/config.hpp
++++ b/library/include/rocwmma/internal/config.hpp
+@@ -39,6 +39,7 @@
+ /// ROCWMMA_ARCH_GFX1102
+ /// ROCWMMA_ARCH_GFX1150
+ /// ROCWMMA_ARCH_GFX1151
++/// ROCWMMA_ARCH_GFX1152
+ /// ROCWMMA_ARCH_GFX1200
+ /// ROCWMMA_ARCH_GFX1201
+ ///
+@@ -69,6 +70,8 @@
+ #define ROCWMMA_ARCH_GFX1150 __gfx1150__
+ #elif defined(__gfx1151__) && ROCWMMA_DEVICE_COMPILE
+ #define ROCWMMA_ARCH_GFX1151 __gfx1151__
++#elif defined(__gfx1152__) && ROCWMMA_DEVICE_COMPILE
++#define ROCWMMA_ARCH_GFX1152 __gfx1152__
+ #elif defined(__gfx1200__) && ROCWMMA_DEVICE_COMPILE
+ #define ROCWMMA_ARCH_GFX1200 __gfx1200__
+ #elif defined(__gfx1201__) && ROCWMMA_DEVICE_COMPILE
+@@ -105,6 +108,9 @@
+ #endif
+ #if !defined(ROCWMMA_ARCH_GFX1151)
+ #define ROCWMMA_ARCH_GFX1151 0
++#endif
++#if !defined(ROCWMMA_ARCH_GFX1152)
++#define ROCWMMA_ARCH_GFX1152 0
+ #endif
+ #if !defined(ROCWMMA_ARCH_GFX1200)
+ #define ROCWMMA_ARCH_GFX1200 0
+@@ -134,7 +140,7 @@
+ #define ROCWMMA_BLOCK_DIM_32_SUPPORTED 1
+ #endif
+ 
+-#if ROCWMMA_ARCH_GFX1100 || ROCWMMA_ARCH_GFX1101 || ROCWMMA_ARCH_GFX1102 || ROCWMMA_ARCH_GFX1150 || ROCWMMA_ARCH_GFX1151
++#if ROCWMMA_ARCH_GFX1100 || ROCWMMA_ARCH_GFX1101 || ROCWMMA_ARCH_GFX1102 || ROCWMMA_ARCH_GFX1150 || ROCWMMA_ARCH_GFX1151 || ROCWMMA_ARCH_GFX1152
+ #define ROCWMMA_ARCH_GFX11 1
+ #define ROCWMMA_WAVE32_MODE 1
+ #define ROCWMMA_BLOCK_DIM_16_SUPPORTED 1
+--- a/library/include/rocwmma/internal/constants.hpp
++++ b/library/include/rocwmma/internal/constants.hpp
+@@ -44,6 +44,7 @@
+         static constexpr uint32_t AMDGCN_ARCH_ID_GFX1102 = 0x1102;
+         static constexpr uint32_t AMDGCN_ARCH_ID_GFX1150 = 0x1150;
+         static constexpr uint32_t AMDGCN_ARCH_ID_GFX1151 = 0x1151;
++        static constexpr uint32_t AMDGCN_ARCH_ID_GFX1152 = 0x1152;
+         static constexpr uint32_t AMDGCN_ARCH_ID_GFX1200 = 0x1200;
+         static constexpr uint32_t AMDGCN_ARCH_ID_GFX1201 = 0x1201;
+         static constexpr uint32_t AMDGCN_ARCH_ID_NONE    = 0x0000;
+@@ -76,6 +77,8 @@
+         static constexpr uint32_t AMDGCN_CURRENT_ARCH_ID = AMDGCN_ARCH_ID_GFX1150;
+ #elif ROCWMMA_ARCH_GFX1151
+         static constexpr uint32_t AMDGCN_CURRENT_ARCH_ID = AMDGCN_ARCH_ID_GFX1151;
++#elif ROCWMMA_ARCH_GFX1152
++        static constexpr uint32_t AMDGCN_CURRENT_ARCH_ID = AMDGCN_ARCH_ID_GFX1152;
+ #elif ROCWMMA_ARCH_GFX1200
+         static constexpr uint32_t AMDGCN_CURRENT_ARCH_ID = AMDGCN_ARCH_ID_GFX1200;
+ #elif ROCWMMA_ARCH_GFX1201
+--- a/library/include/rocwmma/internal/wmma_impl.hpp
++++ b/library/include/rocwmma/internal/wmma_impl.hpp
+@@ -50,7 +50,8 @@
+                                             Constants::AMDGCN_ARCH_ID_GFX1101,
+                                             Constants::AMDGCN_ARCH_ID_GFX1102,
+                                             Constants::AMDGCN_ARCH_ID_GFX1150,
+-                                            Constants::AMDGCN_ARCH_ID_GFX1151> && Cond>;
++                                            Constants::AMDGCN_ARCH_ID_GFX1151,
++                                            Constants::AMDGCN_ARCH_ID_GFX1152> && Cond>;
+ 
+         // Enabler for all of gfx12
+         template <uint32_t TargetId, bool Cond = true>
+@@ -70,6 +71,7 @@
+                                             Constants::AMDGCN_ARCH_ID_GFX1102,
+                                             Constants::AMDGCN_ARCH_ID_GFX1150,
+                                             Constants::AMDGCN_ARCH_ID_GFX1151,
++                                            Constants::AMDGCN_ARCH_ID_GFX1152,
+                                             Constants::AMDGCN_ARCH_ID_GFX1200,
+                                             Constants::AMDGCN_ARCH_ID_GFX1201> && Cond>;
+ 

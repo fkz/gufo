@@ -125,6 +125,7 @@
         in
         {
           default = base;
+          gfx1152 = base.override { gpuTarget = "gfx1152"; };
           # Official artifacts select this output from a tagged source. The
           # default package remains visibly developmental on moving branches.
           release = base.override { inherit releaseVersion; };

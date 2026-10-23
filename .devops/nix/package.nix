@@ -15,9 +15,15 @@
   rocmPackages,
   releaseVersion ? null,
   revision,
+  gpuTarget ? "gfx1151",
 }:
 
 let
+  rocwmma = if gpuTarget == "gfx1152" then
+    rocmPackages.rocwmma.overrideAttrs (old: {
+      patches = (old.patches or [ ]) ++ [ ./patches/rocwmma-gfx1152.patch ];
+    })
+    else rocmPackages.rocwmma;
   # Keep SVM available for managed model/state allocations, but prevent
   # compaction of ROCr's queue save areas and HIP's runtime-owned buffers from
   # suspending inference.
@@ -78,12 +84,13 @@ stdenv.mkDerivation {
     rocmPackages.hipblaslt
     rocmPackages.hipcub
     rocmPackages.rocprim
-    rocmPackages.rocwmma
+    rocwmma
     rocmPackages.rocblas
   ];
 
   cmakeFlags = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
+    "-DCMAKE_HIP_ARCHITECTURES=${gpuTarget}"
     "-DBUILD_TESTING=OFF"
     "-DGUFO_RELEASE_VERSION=${versionLabel}"
     "-DGUFO_REVISION=${revision}"
@@ -117,7 +124,7 @@ stdenv.mkDerivation {
     inherit releaseVersion revision rocmPackages rocmRuntime;
     toolchain = {
       targetPlatform = "x86_64-linux";
-      targetGpu = "gfx1151";
+      targetGpu = gpuTarget;
       cxxCompiler = stdenv.cc.name;
       rocmVersion = rocmPackages.clr.version;
       hipClangVersion = rocmPackages.llvm.clang.version;

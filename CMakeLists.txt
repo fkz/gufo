@@ -46,8 +46,11 @@ set(GUFO_FFPROBE_EXECUTABLE "ffprobe" CACHE STRING
 # CPU-only builds exist for host checks; production targets gfx1151 only.
 option(ENGINE_ENABLE_HIP "Build the gfx1151 HIP backend" ON)
 set(CMAKE_HIP_ARCHITECTURES gfx1151 CACHE STRING "HIP architecture")
-if (ENGINE_ENABLE_HIP AND NOT CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1151")
-  message(FATAL_ERROR "Gufo kernels require CMAKE_HIP_ARCHITECTURES=gfx1151")
+if (ENGINE_ENABLE_HIP AND NOT CMAKE_HIP_ARCHITECTURES MATCHES "^gfx115[12]$")
+  message(FATAL_ERROR "Gufo kernels require gfx1151 or experimental gfx1152")
+endif()
+if (ENGINE_ENABLE_HIP AND CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1152")
+  message(WARNING "Experimental gfx1152 build: only Qwen3.8 Flash-Next is under evaluation")
 endif()
 # Standard ROCm installations; custom prefixes use CMAKE_PREFIX_PATH.
 if (EXISTS /opt/rocm)
