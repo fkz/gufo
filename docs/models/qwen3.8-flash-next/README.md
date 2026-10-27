@@ -175,3 +175,60 @@ Use `python3 tools/models/qwen38_flash_next/expert_usage.py TRACE.csv` to summar
 frequencies and the fraction of selections covered by the most-used experts in
 each layer. This retrospective fixed-set coverage is not an LRU cache hit rate;
 the ordered trace can support that analysis separately.
+
+## SSD-backed expert LRU cache (experimental)
+
+Set `GUFO_EXPERT_CACHE_MIB` to an integer memory budget in MiB. For example,
+32 GiB including the expert workspace and disk transfer buffers:
+
+```sh
+GUFO_EXPERT_CACHE_MIB=32768 nix run --refresh github:fkz/gufo/expert-usage-stats#gfx1152 -- chat --model "$MODEL"
+```
+
+The setting works with `serve llm` too. Unset it or set it to `0` to use the
+original eager upload. Invalid values and budgets too small for a complete
+layer fail explicitly. The error reports the minimum budget for this model.
+Keep the bound GGUF files available and unchanged throughout inference.
+
+Each loaded model owns **one global LRU** keyed by `(layer, expert)`, shared by
+all its sessions and including MTP when loaded. Routed gate/up/down payloads
+stay in their GGUF encoding and are fetched only on demand. The router, shared
+experts, attention and other non-routed weights remain resident. No prediction,
+expert dropping, or additional quantization is performed.
+
+The reservation includes:
+
+- An arena of expert slots, each sized for the largest encoded expert among
+  the loaded layers. Mixed-precision layers therefore leave some slot padding;
+  startup prints the actual slot count, not an estimate from Q4 parameter bits.
+- One reusable layer workspace, sized separately for the largest gate, up and
+  down tensors, with quantized-kernel tail padding.
+- The upload pipeline's roughly 256 MiB of pinned SSD transfer buffers.
+
+KV cache, recurrent state, ordinary executor scratch, other model weights,
+allocator overhead, and small CPU routing/LRU metadata are additional memory.
+The reported resident model reservation includes the cache even while cold;
+physical memory usage can increase as its pages are first populated.
+
+After routing, the cache pins every expert needed by that invocation, evicts
+least-recently-used unpinned entries, and reads misses through the bounded
+GGUF upload pipeline (unbuffered reads where supported). Prefill can pin all
+512 experts in one layer; the minimum budget guarantees this fits. Recency is
+touched in token-row/router-rank order. Separate executors serialize their
+expert workspace use, while a scheduled multi-session batch shares it.
+
+This initial implementation preserves the existing routed kernels by copying
+selected cached weights into the reusable layer workspace. **Even hits incur a
+RAM/device-memory copy.** Miss reads can overlap the independent shared expert;
+routed projections wait for all required uploads. GPU graph replay is disabled
+with caching, and each expert invocation synchronizes before releasing the
+workspace. These costs can reduce throughput even with a high cache hit rate.
+No speed or numerical-parity qualification has been established for this
+experimental path yet.
+
+Normal model teardown logs cache hits, misses, and payload MiB read. Counts
+include prefill, drafts and verification, not just accepted output tokens.
+Every routed selection counts as an access; repeated selections within one
+invocation count as hits after the first miss. Disk-read byte counts exclude
+alignment and filesystem overhead. `GUFO_EXPERT_STATS` can be used alongside
+caching; the trace still contains original model expert IDs.

@@ -195,6 +195,10 @@ struct WeightUpload::State {
 WeightUpload::WeightUpload() : state_(std::make_unique<State>()) {}
 WeightUpload::~WeightUpload() = default;
 
+std::size_t WeightUpload::StagingBytes() noexcept {
+  return kReaders * (kChunkBytes + kAlignment);
+}
+
 std::unique_ptr<WeightUpload> WeightUpload::Create(
     std::span<const core::GgufMappedRegion> regions, std::string* error) {
   std::unique_ptr<WeightUpload> uploader(new WeightUpload());

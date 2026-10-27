@@ -13,6 +13,8 @@
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
+class ExpertCache;
+
 /// One weight resident in device memory, still in its GGUF encoding.
 struct DeviceTensor {
   void* data{nullptr};
@@ -36,6 +38,7 @@ struct DeviceMixer {
 
 struct DeviceLayer {
   bool linear{false};
+  std::uint32_t cache_layer{0};
   DeviceMixer hc_attn;
   DeviceMixer hc_ffn;
 
@@ -102,6 +105,7 @@ public:
   const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
   const DeviceLayer& mtp() const noexcept { return mtp_; }
+  ExpertCache* expert_cache() const noexcept { return expert_cache_.get(); }
   [[nodiscard]] std::size_t resident_bytes() const noexcept { return bytes_; }
   /// Widest K among the BF16/F16 matrices (activation staging for hipBLAS).
   [[nodiscard]] std::size_t max_half_cols() const noexcept {
@@ -115,6 +119,7 @@ public:
 private:
   DeviceModel() = default;
 
+  std::unique_ptr<ExpertCache> expert_cache_;
   Config config_;
   DeviceTensor token_embd_;
   DeviceTensor output_;

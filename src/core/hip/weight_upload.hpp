@@ -18,6 +18,8 @@ class WeightUpload {
 public:
   static std::unique_ptr<WeightUpload> Create(
       std::span<const core::GgufMappedRegion> shards, std::string* error);
+  /// Fixed pinned transfer-buffer reservation, excluding small metadata.
+  static std::size_t StagingBytes() noexcept;
   ~WeightUpload();
   WeightUpload(const WeightUpload&) = delete;
   WeightUpload& operator=(const WeightUpload&) = delete;

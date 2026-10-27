@@ -24,6 +24,7 @@
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/pages.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/expert_cache.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/expert_trace.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -2786,6 +2787,17 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       return false;
     }
   }
+  const bool tail_only = last_only && l.ffn_gate_exps.type == GgmlType::kQ8_0 &&
+                         l.ffn_up_exps.type == GgmlType::kQ8_0 &&
+                         l.ffn_down_exps.type == GgmlType::kQ8_0;
+  std::unique_ptr<ExpertCache::Lease> experts;
+  if (auto* cache = model_->expert_cache()) {
+    const std::size_t first = tail_only ? n_tokens - 1 : 0;
+    experts = cache->Begin(l.cache_layer, s_.ids + first * used,
+                           (n_tokens - first) * used, stream_, error_msg);
+    if (!experts)
+      return false;
+  }
   // The shared expert (gated by the last router row) does not depend on
   // routing. Queue its GEMMs after the count download, then prepare the
   // routed dispatch on the CPU without waiting for these GEMMs to finish.
@@ -2805,9 +2817,9 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                     error_msg)) {
     return false;
   }
-  if (last_only && l.ffn_gate_exps.type == GgmlType::kQ8_0 &&
-      l.ffn_up_exps.type == GgmlType::kQ8_0 &&
-      l.ffn_down_exps.type == GgmlType::kQ8_0) {
+  if (experts && !experts->Ready(error_msg))
+    return false;
+  if (tail_only) {
     // Catch-up retains only the final predictor residual. Keep the router
     // and shared-expert shapes, then run its routed experts with the same
     // tiled quantization and accumulation as the complete prompt batch.
@@ -2819,13 +2831,14 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
           static_cast<std::size_t>(n_tokens - 1) * c.hidden_size;
       const bool ok = MoeExperts(l, x + offset, out + offset, 1, error_msg);
       UseScratch(base);
-      return ok;
+      return experts ? experts->Complete(ok, error_msg) : ok;
     } catch (...) {
       UseScratch(base);
       throw;
     }
   }
-  return MoeExperts(l, x, out, n_tokens, error_msg);
+  const bool ok = MoeExperts(l, x, out, n_tokens, error_msg);
+  return experts ? experts->Complete(ok, error_msg) : ok;
 }
 
 bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
@@ -3013,7 +3026,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    bool synchronize) const {
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
-  if (graph && session.warmed_.contains(key)) {
+  if (graph && !model_->expert_cache() && session.warmed_.contains(key)) {
     hipGraphExec_t exec = nullptr;
     bool enqueued = false;
     if (const auto it = session.graphs_.find(key);

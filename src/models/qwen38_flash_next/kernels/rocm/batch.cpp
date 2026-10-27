@@ -6,6 +6,7 @@
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/expert_cache.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
@@ -759,9 +760,19 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
   RouterTopK(base.router, c.num_experts + 1, base.ids, base.weights, rows,
              c.num_experts, c.num_experts_used, stream_);
   RecordExpertUsage(l, base.ids, rows);
+  std::unique_ptr<ExpertCache::Lease> experts;
+  if (auto* cache = model_->expert_cache()) {
+    experts = cache->Begin(l.cache_layer, base.ids,
+                           static_cast<std::size_t>(rows) * c.num_experts_used,
+                           stream_, error);
+    if (!experts)
+      return false;
+  }
   if (!GatedDenseBatch(l.shexp_up, l.shexp_gate, x, base.shexp_up, rows,
                        error) ||
       !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
+    return false;
+  if (experts && !experts->Ready(error))
     return false;
   if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
       l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
@@ -780,7 +791,7 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     MoeEpilogue(base.down_e, base.weights, base.shexp_out,
                 base.router + c.num_experts, c.num_experts + 1, out, rows,
                 c.num_experts_used, c.hidden_size, stream_);
-    return true;
+    return experts ? experts->Complete(true, error) : true;
   }
   for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
     UseScratch(RowScratch(base, r));
@@ -791,7 +802,7 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     if (!ok)
       return false;
   }
-  return true;
+  return experts ? experts->Complete(true, error) : true;
 }
 
 bool Executor::ForwardBatch(std::span<const BatchItem> items,

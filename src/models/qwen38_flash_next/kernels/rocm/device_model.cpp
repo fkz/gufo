@@ -4,11 +4,16 @@
 
 #include <algorithm>
 #include <cassert>
+#include <charconv>
+#include <cstdlib>
 #include <initializer_list>
+#include <limits>
+#include <string_view>
 #include <utility>
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/expert_cache.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -50,6 +55,7 @@ struct Uploader {
   std::size_t& max_q8_cols;
   std::string* error;
   bool ok{true};
+  bool cache_experts{false};
   std::uint32_t shard_base{0};
   std::uint64_t requested{0};
 
@@ -285,9 +291,11 @@ struct Uploader {
     d.ple_norm_conv = Copy(l.ple_norm_conv);
     d.ple_conv1d = Copy(l.ple_conv1d);
     d.router = Stack({&l.router, &l.shexp_gate_inp});
-    d.ffn_gate_exps = Copy(l.ffn_gate_exps);
-    d.ffn_up_exps = Copy(l.ffn_up_exps);
-    d.ffn_down_exps = Copy(l.ffn_down_exps);
+    if (!cache_experts) {
+      d.ffn_gate_exps = Copy(l.ffn_gate_exps);
+      d.ffn_up_exps = Copy(l.ffn_up_exps);
+      d.ffn_down_exps = Copy(l.ffn_down_exps);
+    }
     d.shexp_gate = Copy(l.shexp_gate);
     d.shexp_up = Copy(l.shexp_up);
     d.shexp_down = Copy(l.shexp_down);
@@ -375,6 +383,22 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       (mtp != nullptr && !layer_supported(mtp->block))) {
     return nullptr;
   }
+  std::size_t cache_budget = 0;
+  if (const char* value = std::getenv("GUFO_EXPERT_CACHE_MIB");
+      value && *value) {
+    const std::string_view text(value);
+    std::uint64_t mib = 0;
+    const auto parsed =
+        std::from_chars(text.data(), text.data() + text.size(), mib);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+        mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+      if (error_msg)
+        *error_msg =
+            "GUFO_EXPERT_CACHE_MIB must be a non-negative integer MiB budget";
+      return nullptr;
+    }
+    cache_budget = static_cast<std::size_t>(mib) << 20;
+  }
   std::unique_ptr<DeviceModel> m(new DeviceModel());
   m->config_ = w.config;
   const auto regions = reader.GetMappedRegions();
@@ -404,16 +428,24 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::size_t max_q8_cols = 32;
     Uploader measure{*stager, nullptr,       conversions, allocations,
                      bytes,   max_half_cols, max_q8_cols, error_msg};
+    measure.cache_experts = cache_budget != 0;
     (void)measure.Model(w, mtp, shard_count);
     if (!measure.ok) {
       return nullptr;
     }
     measured = measure.requested;
   }
-  const hip::WeightAllocator weights(measured);
+  if (cache_budget > std::numeric_limits<std::uint64_t>::max() - measured) {
+    if (error_msg)
+      *error_msg =
+          "expert cache and resident weights exceed addressable memory";
+    return nullptr;
+  }
+  const hip::WeightAllocator weights(measured + cache_budget);
   std::vector<Conversion> conversions;
   Uploader up{*stager,   &weights,          conversions,     m->allocations_,
               m->bytes_, m->max_half_cols_, m->max_q8_cols_, error_msg};
+  up.cache_experts = cache_budget != 0;
   Uploaded uploaded = up.Model(w, mtp, shard_count);
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;
@@ -442,6 +474,14 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::erase(m->allocations_, c.source);
     (void)hipFree(c.source);
     m->bytes_ -= c.count * sizeof(float) + kTailMargin;
+  }
+  if (cache_budget != 0) {
+    m->expert_cache_ =
+        ExpertCache::Create(w, mtp, shard_count, cache_budget, weights,
+                            std::move(stager), m->layers_, m->mtp_, error_msg);
+    if (!m->expert_cache_)
+      return nullptr;
+    m->bytes_ += m->expert_cache_->resident_bytes();
   }
   return m;
 }
