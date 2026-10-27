@@ -1,7 +1,5 @@
 #include "src/cli/serve/inference_backend.hpp"
 
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -11,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -85,6 +84,23 @@ tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
   options.max_output_bytes =
       tokenization::RenderedPromptBoundBytes(max_context);
   return options;
+}
+
+// The text before tokenization. An image renders as its one placeholder, not
+// the visual tokens Prepare expands it into. Template errors are request
+// errors, as in Prepare.
+std::optional<std::string> RenderQwenPrompt(const ChatRequest& request,
+                                            std::uint32_t max_context) {
+  std::string error;
+  auto rendered = tokenization::QwenChatTemplate::Render(
+      request.messages,
+      request.tool_choice == ChatRequest::ToolChoice::kNone
+          ? std::span<const tokenization::ChatTool>{}
+          : std::span<const tokenization::ChatTool>{request.tools},
+      QwenChatOptions(request, max_context), &error);
+  if (!rendered)
+    throw std::invalid_argument(error);
+  return rendered;
 }
 
 std::optional<std::size_t> CountQwenPromptTokens(
@@ -1235,6 +1251,11 @@ public:
                                  image_cache_);
   }
 
+  [[nodiscard]] std::optional<std::string> RenderPrompt(
+      const ChatRequest& request) const override {
+    return RenderQwenPrompt(request, max_context_);
+  }
+
   void SetPromptContext(
       TextRunnerState& state,
       std::shared_ptr<const TextPromptContext> context) const override {
@@ -1726,62 +1747,20 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
-    std::vector<models::deepseek_v4_flash::ChatMessage> messages;
-    messages.reserve(request.messages.size());
-    for (const auto& message : request.messages) {
-      models::deepseek_v4_flash::ChatMessage converted{
-          .role = std::string(ChatRoleName(message.role)),
-          .content = message.content + message.framing_suffix,
-          .reasoning_content = message.thought,
-          .tool_calls = {},
-          .tool_call_id = message.tool_call_id,
-      };
-      converted.tool_calls.reserve(message.tool_calls.size());
-      for (const auto& call : message.tool_calls) {
-        models::deepseek_v4_flash::ChatMessage::ToolCall converted_call{
-            .name = call.name,
-            .arguments = {},
-            .id = call.id,
-        };
-        converted_call.arguments.reserve(call.arguments.size());
-        for (const auto& argument : call.arguments) {
-          converted_call.arguments.push_back({
-              .name = argument.name,
-              .value = argument.value,
-              .is_string = argument.is_string,
-          });
-        }
-        converted.tool_calls.push_back(std::move(converted_call));
-      }
-      messages.push_back(std::move(converted));
-    }
-
-    std::vector<models::deepseek_v4_flash::ChatTool> tools;
-    if (request.tool_choice != ChatRequest::ToolChoice::kNone) {
-      tools.reserve(request.tools.size());
-      for (const auto& tool : request.tools) {
-        tools.push_back({
-            .name = tool.name,
-            .description = tool.description,
-            .parameters_json = tool.parameters_json,
-            .definition_json =
-                tool.definition_json.empty()
-                    ? std::string{}
-                    : json::parse(tool.definition_json)["function"].dump(),
-        });
-      }
-    }
-    auto options = models::deepseek_v4_flash::ResolveDeepSeekChatOptions(
-        request.reasoning);
-    options.tools_present =
-        !request.tools.empty() &&
-        request.tool_choice != ChatRequest::ToolChoice::kNone;
-    auto tokens =
-        DeepSeekRunnerTokens(model_->EncodeChat(messages, tools, options));
+    const auto input = ConvertChat(request);
+    auto tokens = DeepSeekRunnerTokens(
+        model_->EncodeChat(input.messages, input.tools, input.options));
     if (tokens.empty()) {
       return std::nullopt;
     }
     return tokens;
+  }
+
+  [[nodiscard]] std::optional<std::string> RenderPrompt(
+      const ChatRequest& request) const override {
+    const auto input = ConvertChat(request);
+    return models::deepseek_v4_flash::RenderChat(input.messages, input.tools,
+                                                 input.options);
   }
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
@@ -2240,6 +2219,67 @@ public:
   }
 
 private:
+  struct DeepSeekChatInput {
+    std::vector<models::deepseek_v4_flash::ChatMessage> messages;
+    std::vector<models::deepseek_v4_flash::ChatTool> tools;
+    models::deepseek_v4_flash::ChatTemplateOptions options;
+  };
+
+  [[nodiscard]] static DeepSeekChatInput ConvertChat(
+      const ChatRequest& request) {
+    std::vector<models::deepseek_v4_flash::ChatMessage> messages;
+    messages.reserve(request.messages.size());
+    for (const auto& message : request.messages) {
+      models::deepseek_v4_flash::ChatMessage converted{
+          .role = std::string(ChatRoleName(message.role)),
+          .content = message.content + message.framing_suffix,
+          .reasoning_content = message.thought,
+          .tool_calls = {},
+          .tool_call_id = message.tool_call_id,
+      };
+      converted.tool_calls.reserve(message.tool_calls.size());
+      for (const auto& call : message.tool_calls) {
+        models::deepseek_v4_flash::ChatMessage::ToolCall converted_call{
+            .name = call.name,
+            .arguments = {},
+            .id = call.id,
+        };
+        converted_call.arguments.reserve(call.arguments.size());
+        for (const auto& argument : call.arguments) {
+          converted_call.arguments.push_back({
+              .name = argument.name,
+              .value = argument.value,
+              .is_string = argument.is_string,
+          });
+        }
+        converted.tool_calls.push_back(std::move(converted_call));
+      }
+      messages.push_back(std::move(converted));
+    }
+
+    std::vector<models::deepseek_v4_flash::ChatTool> tools;
+    if (request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      tools.reserve(request.tools.size());
+      for (const auto& tool : request.tools) {
+        tools.push_back({
+            .name = tool.name,
+            .description = tool.description,
+            .parameters_json = tool.parameters_json,
+            .definition_json =
+                tool.definition_json.empty()
+                    ? std::string{}
+                    : json::parse(tool.definition_json)["function"].dump(),
+        });
+      }
+    }
+    auto options = models::deepseek_v4_flash::ResolveDeepSeekChatOptions(
+        request.reasoning);
+    options.tools_present =
+        !request.tools.empty() &&
+        request.tool_choice != ChatRequest::ToolChoice::kNone;
+    return {std::move(messages), std::move(tools), options};
+  }
+
   std::shared_ptr<models::deepseek_v4_flash::Model> model_;
   std::uint32_t max_context_;
   bool use_dspark_;
@@ -2543,6 +2583,11 @@ public:
                                  image_cache_);
   }
 
+  [[nodiscard]] std::optional<std::string> RenderPrompt(
+      const ChatRequest& request) const override {
+    return RenderQwenPrompt(request, max_context_);
+  }
+
   void SetPromptContext(
       TextRunnerState& state,
       std::shared_ptr<const TextPromptContext> context) const override {
@@ -2751,11 +2796,10 @@ public:
     sampling::SamplerState working_sampler = sampler;
     QwenFlashNextSession::DecodeResult decoded;
     std::string error;
-    const auto budget =
-        std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
     // Use the same request policy as SelectNext and the batched MTP path.
-    // The engine stops before committing EOS or work beyond it.
-    if (!qfn.session().DecodeStep(budget, working_sampler, &decoded, &error,
+    // The engine bounds the physical block and stops at EOS. Preserve the
+    // remaining request budget so its policy can recognize a short tail.
+    if (!qfn.session().DecodeStep(max_tokens, working_sampler, &decoded, &error,
                                   qfn.stop_at_eos())) {
       throw std::runtime_error("Qwen3.8-Flash-Next MTP decode failed: " +
                                error);
@@ -2829,11 +2873,8 @@ public:
       auto& session = state.session();
       auto& sampler = samplers.emplace_back(decodes[i].sampler.get());
       before.push_back(session.Statistics());
-      requests.push_back(
-          {&session,
-           std::min<std::size_t>(decodes[i].max_tokens,
-                                 std::uint64_t{max_draft_tokens_} + 1),
-           &sampler, &results[i], state.stop_at_eos(), &outcomes[i]});
+      requests.push_back({&session, decodes[i].max_tokens, &sampler,
+                          &results[i], state.stop_at_eos(), &outcomes[i]});
     }
     std::string error;
     (void)QwenFlashNextSession::DecodeBatch(requests, &error);
@@ -2900,6 +2941,7 @@ struct InferenceBackend::Impl {
   struct State {
     std::shared_ptr<TextGenerationScheduler> scheduler;
     std::string model_id;
+    std::vector<std::string> extra_model_ids;
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
     bool supports_images{false};
@@ -3571,6 +3613,20 @@ std::string InferenceBackend::model_id() const {
 #endif
 }
 
+std::vector<std::string> InferenceBackend::model_ids() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr)
+    return {"unknown"};
+  std::vector<std::string> ids{state->model_id};
+  ids.insert(ids.end(), state->extra_model_ids.begin(),
+             state->extra_model_ids.end());
+  return ids;
+#else
+  return {"unknown"};
+#endif
+}
+
 bool InferenceBackend::ready() const {
 #if defined(ENGINE_ENABLE_HIP)
   return impl_->Snapshot() != nullptr;
@@ -3683,9 +3739,9 @@ void InferenceBackend::set_served_artifact(const std::string& model_path,
 #endif
 }
 
-void InferenceBackend::set_model_id(const std::string& model_id) {
+void InferenceBackend::set_model_ids(std::vector<std::string> model_ids) {
 #if defined(ENGINE_ENABLE_HIP)
-  if (model_id.empty()) {
+  if (model_ids.empty()) {
     return;
   }
   const std::lock_guard<std::mutex> lock(impl_->state_mutex);
@@ -3693,10 +3749,13 @@ void InferenceBackend::set_model_id(const std::string& model_id) {
     return;
   }
   auto updated = std::make_shared<Impl::State>(*impl_->state);
-  updated->model_id = model_id;
+  updated->model_id = std::move(model_ids.front());
+  updated->extra_model_ids.assign(
+      std::make_move_iterator(model_ids.begin() + 1),
+      std::make_move_iterator(model_ids.end()));
   impl_->state = std::move(updated);
 #else
-  (void)model_id;
+  (void)model_ids;
 #endif
 }
 
@@ -3933,6 +3992,26 @@ std::optional<std::size_t> InferenceBackend::count_chat_tokens(
       ConstrainChatRequest(request, state->scheduler->runner(), &sampling);
   const auto& effective_request = constrained ? *constrained : request;
   return state->scheduler->runner().CountPromptTokens(effective_request);
+#else
+  (void)request;
+  return std::nullopt;
+#endif
+}
+
+std::optional<std::string> InferenceBackend::render_chat_prompt(
+    const ChatRequest& request) const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr) {
+    return std::nullopt;
+  }
+  // The same preparation as count_chat_tokens(), so the text is what chat()
+  // would tokenize.
+  auto sampling = sampling::SamplingConfig{};
+  auto constrained =
+      ConstrainChatRequest(request, state->scheduler->runner(), &sampling);
+  const auto& effective_request = constrained ? *constrained : request;
+  return state->scheduler->runner().RenderPrompt(effective_request);
 #else
   (void)request;
   return std::nullopt;

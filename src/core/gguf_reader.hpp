@@ -145,9 +145,10 @@ struct GgufTensorInfo {
 struct GgufMappedRegion {
   const void* data{nullptr};
   std::size_t size{0};
-  /// Borrowed descriptor, valid for the reader lifetime; -1 for memory images
-  /// and on Windows, where unbuffered readers reopen `source_path` instead.
-  int file_descriptor{-1};
+  /// Borrowed platform handle of the mapping, valid for the reader lifetime;
+  /// invalid for memory images. Weight-upload readers duplicate or reopen it
+  /// instead of resolving `source_path` again.
+  platform::PlatformFile file_descriptor{platform::kInvalidFile};
   std::filesystem::path source_path{};
 };
 

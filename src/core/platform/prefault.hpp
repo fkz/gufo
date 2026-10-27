@@ -20,7 +20,7 @@
 #endif
 
 namespace gufo::platform {
-#if defined(_WIN32)
+#if defined(_WIN32) && !defined(__HIP_DEVICE_COMPILE__)
 namespace detail {
 
 inline int PrefaultExceptionFilter(EXCEPTION_POINTERS* exception,
@@ -65,6 +65,13 @@ inline DWORD TouchMappedPages(std::uintptr_t begin, std::size_t bytes,
 /// asks the memory manager to prefetch the range into the standby list and
 /// then touches pages in parallel so failures surface before registration.
 inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  // Host-only population never runs in a device pass of a .hip translation
+  // unit; the device pass only needs this declaration to parse.
+  static_cast<void>(data);
+  static_cast<void>(bytes);
+  return;
+#else
   if (bytes == 0)
     return;
 #if defined(_WIN32)
@@ -132,6 +139,7 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
                             "cannot read mapped weights");
 #endif
   }
+#endif  // !__HIP_DEVICE_COMPILE__
 }
 
 }  // namespace gufo::platform

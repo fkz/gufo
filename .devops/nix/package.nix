@@ -10,8 +10,11 @@
   libpng,
   libjpeg,
   libwebp,
+  libsndfile,
+  soxr,
   openssl,
   ffmpeg-headless,
+  ccache,
   rocmPackages,
   releaseVersion ? null,
   revision,
@@ -27,8 +30,16 @@ let
   # Keep SVM available for managed model/state allocations, but prevent
   # compaction of ROCr's queue save areas and HIP's runtime-owned buffers from
   # suspending inference.
+  # ROCr 1.21 (ROCm 10) moved the queue code, so it takes a rebased patch.
   rocmRuntime = rocmPackages.rocm-runtime.overrideAttrs (old: {
-    patches = (old.patches or [ ]) ++ [ ./patches/rocr-fixed-cwsr.patch ];
+    patches = (old.patches or [ ]) ++ [
+      (
+        if lib.versionAtLeast rocmPackages.rocm-runtime.version "10" then
+          ./patches/rocr-fixed-cwsr-rocm10.patch
+        else
+          ./patches/rocr-fixed-cwsr.patch
+      )
+    ];
   });
   versionLabel = if releaseVersion == null then "development" else releaseVersion;
   packageVersion =
@@ -77,6 +88,8 @@ stdenv.mkDerivation {
     libpng
     libjpeg
     libwebp
+    libsndfile
+    soxr
     openssl
     ffmpeg-headless
     rocmPackages.clr
@@ -98,6 +111,30 @@ stdenv.mkDerivation {
     "-DGUFO_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
     "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
   ];
+
+  # CI exposes a persistent /tmp/gufo-ccache through extra-sandbox-paths for
+  # C/C++ sources. Keep HIP uncached: Clang emits a bundled preprocessor output
+  # whose included headers ccache 4.13.6 does not record. A header-only change
+  # can then reuse a stale HIP object, including one from the timing baseline.
+  preConfigure = ''
+    ccache_dir=/tmp/gufo-ccache
+    if [[ -d "$ccache_dir" && -w "$ccache_dir" ]]; then
+      export CCACHE_DIR="$ccache_dir"
+      export CCACHE_COMPILERCHECK=content
+      export CCACHE_MAXSIZE=4G
+      export CCACHE_NOHASHDIR=true
+      export CCACHE_UMASK=000
+      cmakeFlagsArray+=(
+        "-DGUFO_CCACHE_PROGRAM=${ccache}/bin/ccache"
+      )
+      ${ccache}/bin/ccache --zero-stats
+    fi
+  '';
+  postBuild = ''
+    if [[ -n "''${CCACHE_DIR:-}" ]]; then
+      ${ccache}/bin/ccache --show-stats
+    fi
+  '';
 
   doInstallCheck = true;
   postFixup = ''

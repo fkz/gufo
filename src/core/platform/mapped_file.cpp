@@ -71,9 +71,9 @@ ReadOnlyMappedFile::~ReadOnlyMappedFile() {
   Close();
 }
 
-int ReadOnlyMappedFile::PlatformDescriptor() const noexcept {
+PlatformFile ReadOnlyMappedFile::PlatformHandle() const noexcept {
 #if defined(_WIN32)
-  return -1;
+  return handle_;
 #else
   return fd_;
 #endif
@@ -191,27 +191,51 @@ std::size_t SystemPageSize() noexcept {
 #endif
 }
 
-bool RawMappedFile::Open(const std::filesystem::path& path) noexcept {
+bool RawMappedFile::Open(const std::filesystem::path& path, MapHint hint,
+                         std::string* error) noexcept {
+  const auto fail = [&](const char* what, std::uint64_t code) {
+    if (error != nullptr) {
+      if (code == 0)
+        *error = what;
+      else
 #if defined(_WIN32)
-  const HANDLE file = OpenForRead(path, FILE_FLAG_SEQUENTIAL_SCAN);
+        *error = FormatWindowsError(what, static_cast<DWORD>(code));
+#else
+        *error = FormatErrno(what, static_cast<int>(code));
+#endif
+    }
+    return false;
+  };
+#if defined(_WIN32)
+  const DWORD attributes = hint == MapHint::kSequential
+                               ? FILE_FLAG_SEQUENTIAL_SCAN
+                               : FILE_ATTRIBUTE_NORMAL;
+  const HANDLE file = OpenForRead(path, attributes);
   if (file == INVALID_HANDLE_VALUE)
-    return false;
+    return fail("cannot open", GetLastError());
   LARGE_INTEGER file_size{};
-  if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0) {
+  if (!GetFileSizeEx(file, &file_size)) {
+    const DWORD code = GetLastError();
     CloseHandle(file);
-    return false;
+    return fail("cannot stat", code);
+  }
+  if (file_size.QuadPart <= 0) {
+    CloseHandle(file);
+    return fail("file is empty", 0);
   }
   const HANDLE section =
       CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (section == nullptr) {
+    const DWORD code = GetLastError();
     CloseHandle(file);
-    return false;
+    return fail("cannot create mapping", code);
   }
   void* view = MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0);
   if (view == nullptr) {
+    const DWORD code = GetLastError();
     CloseHandle(section);
     CloseHandle(file);
-    return false;
+    return fail("cannot map", code);
   }
   data = view;
   size = static_cast<std::size_t>(file_size.QuadPart);
@@ -223,18 +247,27 @@ bool RawMappedFile::Open(const std::filesystem::path& path) noexcept {
 #else
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0)
-    return false;
+    return fail("cannot open", errno);
   struct stat status{};
-  if (::fstat(fd, &status) != 0 || status.st_size <= 0) {
+  if (::fstat(fd, &status) != 0) {
+    const int code = errno;
     ::close(fd);
-    return false;
+    return fail("cannot stat", code);
+  }
+  if (status.st_size <= 0) {
+    ::close(fd);
+    return fail("file is empty", 0);
   }
   const auto file_size = static_cast<std::size_t>(status.st_size);
   void* mapping = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (mapping == MAP_FAILED) {
+    const int code = errno;
+    ::close(fd);
+    return fail("cannot mmap", code);
+  }
   ::close(fd);
-  if (mapping == MAP_FAILED)
-    return false;
-  (void)::madvise(mapping, file_size, MADV_SEQUENTIAL);
+  if (hint == MapHint::kSequential)
+    (void)::madvise(mapping, file_size, MADV_SEQUENTIAL);
   data = mapping;
   size = file_size;
   view_base = mapping;
@@ -242,12 +275,24 @@ bool RawMappedFile::Open(const std::filesystem::path& path) noexcept {
   return true;
 #endif
 }
-
 bool RawMappedFile::OpenRange(const std::filesystem::path& path,
-                              std::uint64_t offset,
-                              std::size_t length) noexcept {
-  if (length == 0)
+                              std::uint64_t offset, std::size_t length,
+                              MapHint hint, std::string* error) noexcept {
+  const auto fail = [&](const char* what, std::uint64_t code) {
+    if (error != nullptr) {
+      if (code == 0)
+        *error = what;
+      else
+#if defined(_WIN32)
+        *error = FormatWindowsError(what, static_cast<DWORD>(code));
+#else
+        *error = FormatErrno(what, static_cast<int>(code));
+#endif
+    }
     return false;
+  };
+  if (length == 0)
+    return fail("zero length", 0);
 #if defined(_WIN32)
   SYSTEM_INFO info{};
   GetSystemInfo(&info);
@@ -259,37 +304,46 @@ bool RawMappedFile::OpenRange(const std::filesystem::path& path,
   const std::uint64_t base = offset - (offset % granularity);
   const std::uint64_t span = offset - base + length;
   if (span > (std::numeric_limits<std::size_t>::max)())
-    return false;
+    return fail("range overflow", 0);
 #if defined(_WIN32)
-  const HANDLE file = OpenForRead(path, FILE_FLAG_SEQUENTIAL_SCAN);
+  const DWORD attributes = hint == MapHint::kSequential
+                               ? FILE_FLAG_SEQUENTIAL_SCAN
+                               : FILE_ATTRIBUTE_NORMAL;
+  const HANDLE file = OpenForRead(path, attributes);
   if (file == INVALID_HANDLE_VALUE)
-    return false;
+    return fail("cannot open", GetLastError());
   const HANDLE section =
       CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
   if (section == nullptr) {
+    const DWORD code = GetLastError();
     CloseHandle(file);
-    return false;
+    return fail("cannot create mapping", code);
   }
   void* view =
       MapViewOfFile(section, FILE_MAP_READ, static_cast<DWORD>(base >> 32),
                     static_cast<DWORD>(base), static_cast<std::size_t>(span));
   if (view == nullptr) {
+    const DWORD code = GetLastError();
     CloseHandle(section);
     CloseHandle(file);
-    return false;
+    return fail("cannot map", code);
   }
   this->file = file;
   this->section = section;
 #else
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0)
-    return false;
+    return fail("cannot open", errno);
   void* view = ::mmap(nullptr, static_cast<std::size_t>(span), PROT_READ,
                       MAP_PRIVATE, fd, static_cast<off_t>(base));
+  if (view == MAP_FAILED) {
+    const int code = errno;
+    ::close(fd);
+    return fail("cannot mmap", code);
+  }
   ::close(fd);
-  if (view == MAP_FAILED)
-    return false;
-  (void)::madvise(view, static_cast<std::size_t>(span), MADV_SEQUENTIAL);
+  if (hint == MapHint::kSequential)
+    (void)::madvise(view, static_cast<std::size_t>(span), MADV_SEQUENTIAL);
 #endif
   data = static_cast<std::uint8_t*>(view) + (offset - base);
   size = length;
@@ -318,11 +372,18 @@ void RawMappedFile::Close() noexcept {
   view_size = 0;
 }
 
-PlatformFile OpenReadFile(const std::filesystem::path& path) noexcept {
+PlatformFile OpenReadFile(const std::filesystem::path& path,
+                          std::string* error) noexcept {
 #if defined(_WIN32)
-  return OpenForRead(path, FILE_ATTRIBUTE_NORMAL);
+  const HANDLE file = OpenForRead(path, FILE_ATTRIBUTE_NORMAL);
+  if (file == INVALID_HANDLE_VALUE && error != nullptr)
+    *error = FormatWindowsError("CreateFileW", GetLastError());
+  return file;
 #else
-  return ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0 && error != nullptr)
+    *error = FormatErrno("cannot open", errno);
+  return fd;
 #endif
 }
 
@@ -347,7 +408,19 @@ void CloseFile(PlatformFile file) noexcept {
 std::size_t ReadFileAt(PlatformFile file, void* output, std::size_t bytes,
                        std::uint64_t offset) noexcept {
 #if defined(_WIN32)
+  struct ThreadEvent {
+    HANDLE handle = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ~ThreadEvent() {
+      if (handle != nullptr)
+        CloseHandle(handle);
+    }
+  };
+  thread_local ThreadEvent event;
+  if (event.handle == nullptr)
+    return 0;
   OVERLAPPED overlapped{};
+  overlapped.hEvent = event.handle;
+  ResetEvent(overlapped.hEvent);
   overlapped.Offset = static_cast<DWORD>(offset);
   overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
   // ReadFile takes a DWORD count; larger requests return a short read.
@@ -355,7 +428,10 @@ std::size_t ReadFileAt(PlatformFile file, void* output, std::size_t bytes,
   DWORD read_bytes = 0;
   if (!ReadFile(static_cast<HANDLE>(file), output, request, &read_bytes,
                 &overlapped)) {
-    return 0;
+    if (GetLastError() != ERROR_IO_PENDING ||
+        !GetOverlappedResult(static_cast<HANDLE>(file), &overlapped,
+                             &read_bytes, TRUE))
+      return 0;
   }
   return read_bytes;
 #else
@@ -376,6 +452,60 @@ std::optional<std::uint64_t> FileSizeBytes(PlatformFile file) noexcept {
   if (::fstat(file, &status) != 0 || status.st_size < 0)
     return std::nullopt;
   return static_cast<std::uint64_t>(status.st_size);
+#endif
+}
+
+PlatformFile DuplicateFile(PlatformFile file) noexcept {
+  if (!FileValid(file))
+    return kInvalidFile;
+#if defined(_WIN32)
+  HANDLE copy = nullptr;
+  if (!DuplicateHandle(GetCurrentProcess(), static_cast<HANDLE>(file),
+                       GetCurrentProcess(), &copy, 0, FALSE,
+                       DUPLICATE_SAME_ACCESS))
+    return kInvalidFile;
+  return copy;
+#else
+  return ::fcntl(file, F_DUPFD_CLOEXEC, 0);
+#endif
+}
+
+PlatformFile ReopenUnbuffered(PlatformFile file) noexcept {
+  if (!FileValid(file))
+    return kInvalidFile;
+#if defined(_WIN32)
+  // ReOpenFile fails when the desired share mode conflicts with the original
+  // open; callers fall back to buffered I/O.
+  HANDLE reopened =
+      ReOpenFile(static_cast<HANDLE>(file), GENERIC_READ,
+                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                 FILE_FLAG_NO_BUFFERING);
+  return reopened == INVALID_HANDLE_VALUE ? kInvalidFile : reopened;
+#else
+  // Reopening the retained descriptor creates an independent O_DIRECT file
+  // description without resolving the original, replaceable pathname.
+  const auto path = "/proc/self/fd/" + std::to_string(file);
+  return ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+#endif
+}
+
+PlatformFile ReopenRandomReadFile(PlatformFile file, bool& direct) noexcept {
+  direct = false;
+#if defined(_WIN32)
+  if (!FileValid(file))
+    return kInvalidFile;
+  // NTFS serializes non-cached reads while another range of the file is
+  // mapped. Cached overlapped reads preserve concurrency; their cached pages
+  // remain reclaimable rather than part of the model's resident weights.
+  HANDLE reopened =
+      ReOpenFile(static_cast<HANDLE>(file), GENERIC_READ,
+                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                 FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED);
+  return reopened == INVALID_HANDLE_VALUE ? kInvalidFile : reopened;
+#else
+  const auto reopened = ReopenUnbuffered(file);
+  direct = FileValid(reopened);
+  return reopened;
 #endif
 }
 
