@@ -4,10 +4,13 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -21,6 +24,7 @@
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/pages.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/expert_trace.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -896,7 +900,129 @@ void Session::Reset(bool reuse_mtp) {
   }
 }
 
+bool Executor::InitExpertUsage(std::string* error) {
+  const char* prefix = std::getenv("GUFO_EXPERT_STATS");
+  if (!prefix || !*prefix)
+    return true;
+  static std::atomic<unsigned> serial{0};
+  const auto stamp =
+      std::chrono::system_clock::now().time_since_epoch().count();
+  expert_usage_path_ = std::string(prefix) + "." + std::to_string(stamp) + "." +
+                       std::to_string(serial++) + ".csv";
+  // Four full model passes between host synchronization points. Overflow is
+  // reported as an error, never silently omitted from the trace.
+  expert_usage_capacity_ =
+      std::size_t{options_.max_batch} * (config().num_layers + 1) * 4;
+  const auto bytes = 2 * sizeof(unsigned long long) +
+                     expert_usage_capacity_ * 14 * sizeof(std::uint32_t);
+  if (!Check(hip::AllocateDevice(&expert_usage_, bytes),
+             "expert trace allocation", error))
+    return false;
+  if (!Check(
+          hipMemsetAsync(expert_usage_, 0, 2 * sizeof(*expert_usage_), stream_),
+          "expert trace initialization", error) ||
+      !Check(hipStreamSynchronize(stream_), "expert trace initialization",
+             error)) {
+    (void)hipFree(expert_usage_);
+    expert_usage_ = nullptr;
+    return false;
+  }
+  std::ofstream out(expert_usage_path_);
+  out << "routing_id,component,layer,token_row";
+  for (unsigned i = 0; i < config().num_experts_used; ++i)
+    out << ",expert_" << i;
+  out << '\n';
+  out.close();
+  if (!out) {
+    AssignError(error, "cannot write expert trace to " + expert_usage_path_);
+    (void)hipFree(expert_usage_);
+    expert_usage_ = nullptr;
+    return false;
+  }
+  std::cerr << "Expert usage statistics: " << expert_usage_path_ << '\n';
+  return true;
+}
+
+void Executor::RecordExpertUsage(const DeviceLayer& layer,
+                                 const std::int32_t* ids,
+                                 std::uint32_t rows) const {
+  if (!expert_usage_)
+    return;
+  std::size_t index = config().num_layers;
+  for (std::size_t i = 0; i < model_->layers().size(); ++i)
+    if (&model_->layers()[i] == &layer) {
+      index = i;
+      break;
+    }
+  TraceExpertUsage(ids, expert_usage_, expert_usage_capacity_, rows,
+                   static_cast<std::uint32_t>(index), stream_);
+}
+
+bool Executor::WriteExpertUsage() const {
+  if (!expert_usage_)
+    return true;
+  if (expert_usage_failed_)
+    return false;
+  // A partial file write must not be retried and duplicate earlier rows.
+  expert_usage_failed_ = true;
+  unsigned long long rows = 0;
+  if (hipMemcpy(&rows, expert_usage_, sizeof(rows), hipMemcpyDeviceToHost) !=
+      hipSuccess)
+    return false;
+  if (rows > expert_usage_capacity_) {
+    std::cerr << "Expert trace buffer overflow; trace is incomplete: "
+              << expert_usage_path_ << '\n';
+    return false;
+  }
+  if (rows == 0) {
+    expert_usage_failed_ = false;
+    return true;
+  }
+  std::vector<std::uint32_t> records(rows * 14);
+  if (hipMemcpy(records.data(), expert_usage_ + 2,
+                records.size() * sizeof(records[0]),
+                hipMemcpyDeviceToHost) != hipSuccess)
+    return false;
+  std::ofstream out(expert_usage_path_, std::ios::app);
+  for (std::size_t row = 0; row < rows; ++row) {
+    const auto* record = records.data() + row * 14;
+    const auto routing =
+        std::uint64_t{record[0]} | (std::uint64_t{record[1]} << 32);
+    out << routing << ',' << (record[2] < config().num_layers ? "trunk" : "mtp")
+        << ',' << record[2] << ',' << record[3];
+    for (unsigned i = 0; i < 10; ++i)
+      out << ',' << record[4 + i];
+    out << '\n';
+  }
+  out.close();
+  if (!out) {
+    std::cerr << "Cannot append expert trace: " << expert_usage_path_ << '\n';
+    return false;
+  }
+  // Preserve the routing sequence counter across downloads and graph replays.
+  expert_usage_failed_ =
+      hipMemset(expert_usage_, 0, sizeof(*expert_usage_)) != hipSuccess;
+  return !expert_usage_failed_;
+}
+
+hipError_t Executor::Synchronize() const {
+  const auto status = hipStreamSynchronize(stream_);
+  if (status != hipSuccess)
+    return status;
+  return WriteExpertUsage() ? hipSuccess : hipErrorUnknown;
+}
+
 Executor::~Executor() {
+  if (expert_usage_) {
+    try {
+      if (hipStreamSynchronize(stream_) != hipSuccess || !WriteExpertUsage())
+        std::cerr << "Failed to save expert usage: " << expert_usage_path_
+                  << '\n';
+    } catch (const std::exception& error) {
+      std::cerr << "Failed to save expert usage: " << error.what() << '\n';
+    }
+    (void)hipFree(expert_usage_);
+  }
   // Readers write pinned staging memory; drain them before freeing it,
   // including when a forward failed before reaching PLE.
   if (ple_pending_ || prefetch_.pending) {
@@ -955,6 +1081,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     AssignError(error_msg, "hipblasCreate failed");
     return nullptr;
   }
+  if (!e->InitExpertUsage(error_msg))
+    return nullptr;
   const Config& c = model.config();
   if (options.max_context > c.MaxContextLength()) {
     AssignError(error_msg, "executor context exceeds the model context");
@@ -1341,7 +1469,7 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   if (s->mtp_.draft_rows != nullptr &&
       (!ClearDraftRows(*s, 0, error_msg) ||
        !AppendDraftRows(*s, 0, model_->draft_specials(), error_msg) ||
-       !Check(hipStreamSynchronize(stream_), "draft table init", error_msg))) {
+       !Check(Synchronize(), "draft table init", error_msg))) {
     return nullptr;
   }
   return s;
@@ -2645,6 +2773,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
              c.num_experts, used, stream_);
+  RecordExpertUsage(l, s_.ids, n_tokens);
   if (ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
@@ -2831,7 +2960,7 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
                               hidden.size_bytes(), hipMemcpyDeviceToHost,
                               stream_),
                "trunk hidden download", error_msg) &&
-         Check(hipStreamSynchronize(stream_), "trunk hidden", error_msg);
+         Check(Synchronize(), "trunk hidden", error_msg);
 }
 
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
@@ -2947,8 +3076,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
     }
     session.warmed_.insert(key);
   }
-  return !synchronize ||
-         Check(hipStreamSynchronize(stream_), "forward", error_msg);
+  return !synchronize || Check(Synchronize(), "forward", error_msg);
 }
 
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
@@ -3367,7 +3495,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
             ? 0
             : std::min(session.blocks_, session.position_ / c.compress_ratio);
   }
-  if (!Check(hipStreamSynchronize(stream_), "rollback", error_msg)) {
+  if (!Check(Synchronize(), "rollback", error_msg)) {
     return false;
   }
   if (logits != nullptr) {
@@ -3842,7 +3970,7 @@ bool Executor::RestoreSnapshot(Session& session,
   if (layout.images.empty())
     session.ConfigureVision(nullptr, nullptr, stream_);
   // The session's queued work targets buffers the copies overwrite.
-  if (!Check(hipStreamSynchronize(stream_), "restore drain", error_msg)) {
+  if (!Check(Synchronize(), "restore drain", error_msg)) {
     return false;
   }
   const bool borrowed = deferred && deferred->registry_ == session.snapshots_;
@@ -4089,8 +4217,7 @@ bool Executor::ReadVerificationRows(std::uint32_t row, std::span<float> logits,
                               logits.size_bytes(), hipMemcpyDeviceToHost,
                               stream_),
                "constrained verification row download", error_msg) &&
-         Check(hipStreamSynchronize(stream_), "constrained verification",
-               error_msg);
+         Check(Synchronize(), "constrained verification", error_msg);
 }
 
 bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
@@ -4160,8 +4287,8 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                      predictions.size_bytes(), hipMemcpyDeviceToHost, stream_),
       "greedy MTP predictions download", error_msg);
   // Drain even after a failed download before releasing the upload source.
-  const bool completed = Check(hipStreamSynchronize(stream_),
-                               "greedy MTP verification", error_msg);
+  const bool completed =
+      Check(Synchronize(), "greedy MTP verification", error_msg);
   return copied && completed;
 }
 
@@ -4214,7 +4341,7 @@ bool Executor::SampledMtpCandidates(
                      hipMemcpyDeviceToHost, stream_),
       "compact verification candidates", error_msg);
   const bool completed =
-      Check(hipStreamSynchronize(stream_), "compact verification", error_msg);
+      Check(Synchronize(), "compact verification", error_msg);
   if (!copied || !completed)
     return false;
   for (std::size_t row = 0; row < rows; ++row)

@@ -431,11 +431,11 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   try {
     ok = body();
   } catch (...) {
-    (void)hipStreamSynchronize(stream_);
+    (void)Synchronize();
     UseScratch(base);
     throw;
   }
-  const auto status = hipStreamSynchronize(stream_);
+  const auto status = Synchronize();
   UseScratch(base);
   if (!ok || !Check(status, error))
     return false;
@@ -486,7 +486,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                        ? item.session
                        : nullptr,
                    error) ||
-          !Check(hipStreamSynchronize(stream_), error)) {
+          !Check(Synchronize(), error)) {
         return false;
       }
       if (item.output.token != nullptr)
@@ -635,11 +635,11 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   try {
     ok = body();
   } catch (...) {
-    (void)hipStreamSynchronize(stream_);
+    (void)Synchronize();
     UseScratch(base);
     throw;
   }
-  const auto status = hipStreamSynchronize(stream_);
+  const auto status = Synchronize();
   UseScratch(base);
   if (!ok || !Check(status, error))
     return false;
@@ -758,6 +758,7 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     return false;
   RouterTopK(base.router, c.num_experts + 1, base.ids, base.weights, rows,
              c.num_experts, c.num_experts_used, stream_);
+  RecordExpertUsage(l, base.ids, rows);
   if (!GatedDenseBatch(l.shexp_up, l.shexp_gate, x, base.shexp_up, rows,
                        error) ||
       !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
@@ -1101,11 +1102,11 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   try {
     ok = body();
   } catch (...) {
-    (void)hipStreamSynchronize(stream_);
+    (void)Synchronize();
     UseScratch(base);
     throw;
   }
-  const auto status = hipStreamSynchronize(stream_);
+  const auto status = Synchronize();
   UseScratch(base);
   if (!ok || !Check(status, error)) {
     return false;
@@ -1137,7 +1138,7 @@ bool Executor::SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
                               count * sizeof(float), hipMemcpyDeviceToHost,
                               stream_),
                error) ||
-        !Check(hipStreamSynchronize(stream_), error)) {
+        !Check(Synchronize(), error)) {
       return false;
     }
     std::copy_n(logits_host_, count, logits);

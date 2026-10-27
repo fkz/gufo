@@ -588,6 +588,16 @@ private:
            const std::function<bool()>& body, std::string* error_msg,
            bool synchronize = true) const;
 
+  // Optional bounded routing trace; stable addresses also work in graphs.
+  unsigned long long* expert_usage_{nullptr};
+  std::string expert_usage_path_;
+  std::size_t expert_usage_capacity_{0};
+  mutable bool expert_usage_failed_{false};
+  bool InitExpertUsage(std::string* error);
+  void RecordExpertUsage(const DeviceLayer& layer, const std::int32_t* ids,
+                         std::uint32_t rows) const;
+  hipError_t Synchronize() const;
+  bool WriteExpertUsage() const;
   const DeviceModel* model_{nullptr};
   NgramTable* ngram_{nullptr};
   Options options_;

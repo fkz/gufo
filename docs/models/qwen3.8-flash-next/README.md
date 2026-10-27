@@ -125,3 +125,53 @@ Build a microbenchmark with
 `dense_blaslt_sweep.hip` times hipBLASLt on the dense prefill shapes.
 No historical logit dump is required. New retained result summaries belong in
 `artifacts/`; generated traces stay in the ignored top-level `artifacts/` tree.
+
+## Expert access trace
+
+Set `GUFO_EXPERT_STATS` to an output filename prefix before launching Gufo:
+
+```sh
+GUFO_EXPERT_STATS=/tmp/qwen-experts ./result/bin/gufo chat --model "$MODEL"
+```
+
+Use a binary built from this branch and your usual model arguments; the same
+variable also works with `serve llm`. Tracing activates when a Qwen3.8
+Flash Next GPU executor is created. Each executor writes a separate
+`PREFIX.TIMESTAMP.SERIAL.csv`; the parent directory must exist. Disabled by
+default, this diagnostic adds one GPU copy kernel per routing call and downloads
+buffered records at existing stream synchronization points. CSV serialization
+and disk writes happen synchronously; measure overhead before using traced
+runs for performance comparisons.
+
+```csv
+routing_id,component,layer,token_row,expert_0,expert_1,expert_2,expert_3,expert_4,expert_5,expert_6,expert_7,expert_8,expert_9
+0,trunk,0,0,17,203,4,88,9,16,21,42,73,91
+```
+
+There is one row per token row per layer routing invocation. `routing_id` is a
+monotonically increasing **layer routing invocation** ID within that executor,
+not a model-forward ID. Rows sharing it were routed together; `token_row` is
+zero-based within that invocation, not an absolute context position or a stable
+request ID. Layer indices are zero-based, with the MTP block at layer 48.
+Expert columns are router rank, not execution order. Records preserve routing
+invocation order and token-row order within each invocation, including GPU graph
+replays. Multi-request batches do not currently label the originating request.
+
+The trace includes prefill, decode, MTP drafts, rejected speculative work, and
+any other executed routing. Prefix-cache hits that skip computation produce no
+rows. Counts describe performed routing, not accepted output tokens. Trunk and
+MTP expert identities are distinct. Analyze each routing invocation as a batch
+of simultaneous expert requirements, rather than assuming token-row order is
+physical GPU memory-access order.
+
+Records append at normal synchronization points and on executor destruction.
+The GPU buffer holds four full `max_batch` model passes; overflow fails inference
+with an explicit incomplete-trace message rather than silently dropping rows.
+A crash or forced kill can lose the last undrained records. Each CSV is an append
+log: do not treat it as the former cumulative histogram format. Trace files can
+be large (48 rows per trunk token, plus any MTP work).
+
+Use `python3 tools/models/qwen38_flash_next/expert_usage.py TRACE.csv` to summarize
+frequencies and the fraction of selections covered by the most-used experts in
+each layer. This retrospective fixed-set coverage is not an LRU cache hit rate;
+the ordered trace can support that analysis separately.
