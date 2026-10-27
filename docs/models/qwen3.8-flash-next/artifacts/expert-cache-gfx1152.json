@@ -1,0 +1,64 @@
+{
+  "date": "2026-10-27",
+  "target": "gfx1152",
+  "toolchain": "ROCm 7.2.3",
+  "base_commit": "2adabea7",
+  "scope": "synthetic rotating cache-hit MoE block, not full-model throughput",
+  "geometry": {
+    "experts": 64,
+    "selected": 10,
+    "hidden": 2560,
+    "ff": 640,
+    "gate_up": "Q4_K",
+    "down": "Q5_1"
+  },
+  "method": {
+    "cycles": 3,
+    "iterations_per_cycle": 100,
+    "warmups_per_mode_per_cycle": 5,
+    "clock": "CPU steady_clock, includes dispatch and stream synchronization",
+    "per_iteration_stream_sync": "both modes",
+    "disk_io": false,
+    "weight_copy_mode": "copy selected gate, up, down before projection; no padding-clear overhead included"
+  },
+  "cycles_ms_with_copies": [
+    1.47733,
+    1.50048,
+    1.52368
+  ],
+  "cycles_ms_direct": [
+    0.555219,
+    0.545983,
+    0.544976
+  ],
+  "median_ms_with_copies": 1.50048,
+  "median_ms_direct": 0.545983,
+  "ratio": 2.7482174353413935,
+  "earlier_run_during_build": {
+    "with_copies": [
+      1.77305,
+      1.91545,
+      2.20599
+    ],
+    "direct": [
+      0.682598,
+      0.689653,
+      0.855702
+    ],
+    "retained": false,
+    "reason": "CPU contention from concurrent production compilation"
+  },
+  "checks": {
+    "expert_pointer_cases": 47,
+    "result": "bit-identical finite outputs",
+    "paired_projections": true,
+    "cache_lifecycle": "hits, eviction, prefill fallback, delayed peer consumer, asynchronous completion, truncated I/O, sticky failure",
+    "production_build": "pass",
+    "format": "pass"
+  },
+  "full_model": {
+    "status": "unavailable",
+    "reason": "local GGUF shards 2-4 missing; baseline smoke check failed at model load",
+    "model_speedup_claim": false
+  }
+}

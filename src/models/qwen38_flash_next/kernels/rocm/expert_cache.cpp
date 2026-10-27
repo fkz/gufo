@@ -39,7 +39,7 @@ std::unique_ptr<ExpertCache> ExpertCache::Create(
       const auto size = t.RowBytes() * t.rows;
       layer.tensors[i] = {shard_base + t.shard, t.file_offset, size};
       workspace_bytes[i] = std::max(workspace_bytes[i], t.SizeBytes() + kTail);
-      stride += size;
+      stride += size + kTail;
     }
     c.stride_ = std::max(c.stride_, stride);
     c.layers_.push_back(layer);
@@ -48,7 +48,8 @@ std::unique_ptr<ExpertCache> ExpertCache::Create(
     add(layer, 0);
   if (mtp)
     add(mtp->block, mtp_shard_base);
-  std::size_t overhead = hip::WeightUpload::StagingBytes();
+  const auto pointer_bytes = 3 * c.experts_ * sizeof(void*);
+  std::size_t overhead = hip::WeightUpload::StagingBytes() + 2 * pointer_bytes;
   for (auto size : workspace_bytes)
     overhead += size;
   // Pin every distinct expert in a routing invocation. A prefill can request
@@ -84,6 +85,15 @@ std::unique_ptr<ExpertCache> ExpertCache::Create(
       return nullptr;
     }
   }
+  if (c.host_.Allocate(&c.pointers_host_, pointer_bytes) != hipSuccess ||
+      allocator.Allocate(&c.pointers_device_, pointer_bytes) != hipSuccess ||
+      hipEventCreateWithFlags(&c.routed_, hipEventDisableTiming) !=
+          hipSuccess ||
+      hipEventCreateWithFlags(&c.consumed_, hipEventDisableTiming) !=
+          hipSuccess) {
+    c.Fail("pointer table or dependency event allocation failed", error);
+    return nullptr;
+  }
   const auto bind = [&](DeviceLayer& d, const LayerWeights& w,
                         std::uint32_t index) {
     d.cache_layer = index;
@@ -91,9 +101,12 @@ std::unique_ptr<ExpertCache> ExpertCache::Create(
     const std::array dest{&d.ffn_gate_exps, &d.ffn_up_exps, &d.ffn_down_exps};
     for (std::size_t i = 0; i < tensors.size(); ++i) {
       const auto& t = tensors[i];
-      *dest[i] = {c.workspace_[i], t.type, static_cast<std::uint32_t>(t.cols),
+      *dest[i] = {c.workspace_[i],
+                  t.type,
+                  static_cast<std::uint32_t>(t.cols),
                   static_cast<std::uint32_t>(t.rows),
-                  static_cast<std::uint32_t>(t.experts)};
+                  static_cast<std::uint32_t>(t.experts),
+                  c.pointers_device_ + i * c.experts_};
     }
   };
   for (std::size_t i = 0; i < layers.size(); ++i)
@@ -109,7 +122,15 @@ std::unique_ptr<ExpertCache> ExpertCache::Create(
 
 ExpertCache::~ExpertCache() {
   // Finish workers before freeing their destinations, including failed loads.
+  if (consumed_)
+    (void)hipEventSynchronize(consumed_);
   upload_.reset();
+  if (routed_)
+    (void)hipEventDestroy(routed_);
+  if (consumed_)
+    (void)hipEventDestroy(consumed_);
+  if (pointers_device_)
+    (void)hipFree(pointers_device_);
   for (void* p : workspace_)
     if (p)
       (void)hipFree(p);
@@ -133,8 +154,6 @@ ExpertCache::Lease::~Lease() {
     if (hipStreamSynchronize(stream_) != hipSuccess)
       cache_.Fail("consumer stream failed", nullptr);
   }
-  if (routed_)
-    (void)hipEventDestroy(routed_);
 }
 
 std::unique_ptr<ExpertCache::Lease> ExpertCache::Begin(
@@ -149,28 +168,38 @@ std::unique_ptr<ExpertCache::Lease> ExpertCache::Begin(
     Fail("invalid routing request", error);
     return nullptr;
   }
-  lease->ids_.resize(count);
-  if (hipEventCreateWithFlags(&lease->routed_, hipEventDisableTiming) !=
-          hipSuccess ||
-      hipMemcpyAsync(lease->ids_.data(), device_ids,
-                     count * sizeof(std::int32_t), hipMemcpyDeviceToHost,
-                     stream) != hipSuccess ||
-      hipEventRecord(lease->routed_, stream) != hipSuccess) {
+  if (count > ids_capacity_) {
+    const auto capacity = std::max(count, ids_capacity_ * 2);
+    if (host_.Allocate(&ids_host_, capacity * sizeof(std::int32_t)) !=
+        hipSuccess) {
+      Fail("routing staging allocation failed", error);
+      return nullptr;
+    }
+    ids_capacity_ = capacity;
+  }
+  lease->count_ = count;
+  // A peer stream may still be consuming the previous lease. Order the
+  // routing event after that consumer before the CPU can evict its slots.
+  if (hipStreamWaitEvent(stream, consumed_, 0) != hipSuccess ||
+      hipMemcpyAsync(ids_host_, device_ids, count * sizeof(std::int32_t),
+                     hipMemcpyDeviceToHost, stream) != hipSuccess ||
+      hipEventRecord(routed_, stream) != hipSuccess) {
     Fail("routing download failed", error);
     return nullptr;
   }
   return lease;
 }
 
-bool ExpertCache::Lease::Ready(std::string* error) {
-  if (hipEventSynchronize(routed_) != hipSuccess)
+bool ExpertCache::Lease::Ready(bool direct, std::string* error) {
+  if (hipEventSynchronize(cache_.routed_) != hipSuccess)
     return cache_.Fail("routing event failed", error);
-  return cache_.Prepare(layer_, ids_, stream_, error);
+  return cache_.Prepare(layer_, {cache_.ids_host_, count_}, stream_, direct,
+                        error);
 }
 
 bool ExpertCache::Lease::Complete(bool success, std::string* error) {
-  const auto status = hipStreamSynchronize(stream_);
-  complete_ = true;
+  const auto status = hipEventRecord(cache_.consumed_, stream_);
+  complete_ = status == hipSuccess;
   if (status != hipSuccess)
     return cache_.Fail(
         "consumer stream failed: " + std::string(hipGetErrorString(status)),
@@ -180,7 +209,7 @@ bool ExpertCache::Lease::Complete(bool success, std::string* error) {
 
 bool ExpertCache::Prepare(std::uint32_t layer,
                           std::span<const std::int32_t> ids, hipStream_t stream,
-                          std::string* error) {
+                          bool direct, std::string* error) {
   const auto& source = layers_[layer];
   const auto base = static_cast<std::size_t>(layer) * experts_;
   std::vector<bool> required(experts_, false);
@@ -218,7 +247,9 @@ bool ExpertCache::Prepare(std::uint32_t layer,
         if (!upload_->Copy(tensor.shard, tensor.offset + id * tensor.bytes,
                            tensor.bytes, dst, error))
           return Fail(error ? *error : "upload failed", error);
-        dst += tensor.bytes;
+        if (hipMemsetAsync(dst + tensor.bytes, 0, kTail, stream) != hipSuccess)
+          return Fail("slot padding clear failed", error);
+        dst += tensor.bytes + kTail;
         read_bytes_ += tensor.bytes;
       }
     } else {
@@ -228,6 +259,25 @@ bool ExpertCache::Prepare(std::uint32_t layer,
   }
   if (!upload_->Finish(error))
     return Fail(error ? *error : "upload failed", error);
+  // Tables are tiny (12 KiB for 512 experts). The previous routing event
+  // also drained the last table upload, so the host buffer can be reused.
+  std::fill_n(pointers_host_, 3 * experts_, nullptr);
+  for (std::uint32_t id = 0; id < experts_; ++id) {
+    if (!required[id])
+      continue;
+    auto* src =
+        static_cast<const char*>(storage_) + slot_for_key_[base + id] * stride_;
+    for (std::size_t i = 0; i < source.tensors.size(); ++i) {
+      pointers_host_[i * experts_ + id] = src;
+      src += source.tensors[i].bytes + kTail;
+    }
+  }
+  if (hipMemcpyAsync(pointers_device_, pointers_host_,
+                     3 * experts_ * sizeof(void*), hipMemcpyHostToDevice,
+                     stream) != hipSuccess)
+    return Fail("pointer table upload failed", error);
+  if (direct)
+    return true;
   // Quantized kernels can read past an expert's final row. Clear those
   // tails before copying ANY weights: a tail may overlap the next selected
   // expert. Otherwise bytes left by another layer/encoding could decode as
@@ -255,7 +305,7 @@ bool ExpertCache::Prepare(std::uint32_t layer,
       if (hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, stream) !=
           hipSuccess)
         return Fail("workspace copy failed", error);
-      src += bytes;
+      src += bytes + kTail;
     }
   }
   return true;

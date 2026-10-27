@@ -1,5 +1,11 @@
 # Qwen3.8 Flash-Next benchmarks
 
+The gfx1152 expert-cache branch has an isolated cache-hit result of **1.5005 →
+0.5460 ms per expert block** after removing selected-weight workspace copies.
+This is not an end-to-end tok/s result; the tables below remain the prior
+resident-model measurements. See [method and scope](EXPERIMENTS.md#direct-expert-cache-reads-october-27-2026-gfx1152-branch)
+and [qualification limits](QUALITY.md#direct-expert-cache-reads-october-27-2026).
+
 AMD Strix Halo `gfx1151`, 128 GB unified memory. Unsloth `UD-Q4_K_XL` target
 with shared-Q8_0 MTP; adaptive drafting. HTTP, greedy, thinking off.
 Gufo `fec4759d` (October 18, 2026); llama.cpp `b11069` AR and `6fcaa16f` MTP

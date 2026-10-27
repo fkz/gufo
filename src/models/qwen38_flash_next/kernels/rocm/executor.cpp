@@ -1976,7 +1976,8 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
   int rc = -1;
   if (!tiled) {
     rc = qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, x, ids, out, M, K, T,
-                         E, U, stream_);
+                         E, U, stream_, nullptr, nullptr,
+                         {w.expert_pointers, nullptr});
   } else {
     switch (w.type) {
       case GgmlType::kQ4_K:
@@ -2018,12 +2019,14 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                    static_cast<int>(a.type), a.data, b.data, ready, ids, out,
                    static_cast<int>(a.rows), static_cast<int>(a.cols),
                    static_cast<int>(n_tokens), static_cast<int>(a.experts),
-                   static_cast<int>(n_used), stream_)
+                   static_cast<int>(n_used), stream_,
+                   {a.expert_pointers, b.expert_pointers})
              : qfn_mmq_moe_gated_vec(
                    static_cast<int>(a.type), a.data, b.data, x, ids, out,
                    static_cast<int>(a.rows), static_cast<int>(a.cols),
                    static_cast<int>(n_tokens), static_cast<int>(a.experts),
-                   static_cast<int>(n_used), stream_)) != 0) {
+                   static_cast<int>(n_used), stream_,
+                   {a.expert_pointers, b.expert_pointers})) != 0) {
       AssignError(error_msg, "gated expert vector projection failed");
       return false;
     }
@@ -2033,8 +2036,8 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
     if (qfn_mmq_moe_vec(static_cast<int>(a.type), a.data, x, ids, out,
                         static_cast<int>(a.rows), static_cast<int>(a.cols),
                         static_cast<int>(n_tokens), static_cast<int>(a.experts),
-                        static_cast<int>(n_used), stream_, b.data,
-                        s_.up_e) != 0) {
+                        static_cast<int>(n_used), stream_, b.data, s_.up_e,
+                        {a.expert_pointers, b.expert_pointers}) != 0) {
       AssignError(error_msg, "expert vector pair GEMM failed");
       return false;
     }
@@ -2817,7 +2820,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                     error_msg)) {
     return false;
   }
-  if (experts && !experts->Ready(error_msg))
+  if (experts && !experts->Ready(!MatrixRows(n_tokens), error_msg))
     return false;
   if (tail_only) {
     // Catch-up retains only the final predictor residual. Keep the router

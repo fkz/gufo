@@ -1,5 +1,28 @@
 # Qwen3.8 Flash-Next quality
 
+## Direct expert-cache reads, October 27, 2026
+
+The focused GPU `expert_pointer_ops` check passes 47 cases with bit-identical,
+finite outputs against the resident-addressing path. It covers Q4_K/Q5_K/Q8_0
+fused gate/up, caller-prequantized inputs, Q5_1/Q8_0 down projections, paired
+ungated projections, inactive expert rows, odd row counts, scattered expert
+slots, table replacement and batch widths up to 64 (80 slot rows for down).
+The arithmetic bodies are retained; this establishes addressing parity, not
+independent upstream model quality.
+
+The `expert_cache_ops` GPU check covers repeated hits, forced LRU eviction,
+the tiled-prefill workspace, a delayed consumer on a peer stream, asynchronous
+lease completion, truncated-file errors, and sticky failure with drained I/O.
+The gfx1152 production Nix build and repository formatting check pass.
+
+There is no full-model numerical or end-to-end performance result yet. A small
+local model smoke check fails before loading because shards 2–4 of the GGUF
+are absent. It is not a quality pass. MTP and concurrent full-model operation
+remain unqualified; the synthetic cache test covers the shared stream/slot
+lifetime mechanism. The isolated expert-block timing in
+[experiments](EXPERIMENTS.md#direct-expert-cache-reads-october-27-2026-gfx1152-branch)
+does not predict total tokens/second or miss latency.
+
 ## Sampled draft-head costs, October 23, 2026
 
 Based on main `41d93463`, including the expanded greedy-head eligibility.

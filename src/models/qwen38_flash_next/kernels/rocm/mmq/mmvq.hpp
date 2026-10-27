@@ -29,7 +29,8 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              const block_q8_1* input, const int32_t* ids, float* output,
                              int k, int rows, int tokens, int experts_used,
                              int input_stride, hipStream_t stream,
-                             const int32_t* dst_slots = nullptr);
+                             const int32_t* dst_slots = nullptr,
+                             QfnExpertPointers pointers = {});
 // Scratch ints mul_mat_vec_moe_gated needs for 2..MMVQ_MAX_BATCH_SIZE tokens:
 // a group per slot and two anchor lists.
 constexpr int mmvq_moe_group_ints(int tokens, int experts_used) {
@@ -40,10 +41,10 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
                            const block_q8_1* input, const int32_t* ids,
                            int32_t* groups, float* output, int k, int rows,
                            int tokens, int experts_used, int input_stride,
-                           hipStream_t stream);
+                           hipStream_t stream, QfnExpertPointers pointers = {});
 
 void mul_mat_vec_moe_batch_wave64(const void* gate, const void* up,
                                  const block_q8_1* input, const int32_t* groups,
                                  float* output, int k, int rows,
                                  int experts_used, int input_stride,
-                                 hipStream_t stream);
+                                 hipStream_t stream, QfnExpertPointers pointers = {});

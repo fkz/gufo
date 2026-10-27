@@ -22,6 +22,7 @@ struct DeviceTensor {
   std::uint32_t cols{0};
   std::uint32_t rows{0};
   std::uint32_t experts{1};
+  const void* const* expert_pointers{nullptr};
 
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
   [[nodiscard]] const float* f32() const noexcept {

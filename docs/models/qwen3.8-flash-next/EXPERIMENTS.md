@@ -1,5 +1,22 @@
 # Qwen3.8 Flash-Next experiments
 
+## Direct expert-cache reads (October 27, 2026, gfx1152 branch)
+
+| Experiment | Outcome |
+| --- | --- |
+| Read cached experts directly in vector kernels | Retained: decode/verification and batched decode use a device pointer table; large tiled prefill retains the workspace fallback. The focused Q4_K gate/up + Q5_1 down workload fell from 1.5005 to 0.5460 ms/layer (2.75×), with exact output equality. This is a component timing with all payloads resident, not full-model throughput or an SSD-miss benchmark. |
+| Replace end-of-layer CPU waits with a consumer event | Retained: a peer's routing event waits for the previous consumer before eviction. The cache lifecycle check covers a deliberately delayed consumer, forced cross-layer eviction and failed-read cleanup. Routing still requires a CPU-visible result. |
+| Use resident execution when the budget fits every expert | Retained: exact encoded tensor sizes determine the full-cache threshold; budgets above it use the original upload/layout and GPU graphs. Full-model runtime qualification is pending because only the first GGUF shard is available locally. |
+
+The timing rotates ten of 64 synthetic experts per iteration, beyond MALL
+capacity, with H=2560 and F=640. Both modes retain the same per-iteration
+stream synchronization; the copy mode includes three selected-weight copies
+per expert, and both execute the same quantized projections. Three alternating
+100-iteration cycles after five warmups give the median above. ROCm 7.2.3,
+production MMQ optimization flags, gfx1152. An earlier run during compilation
+was noisier (1.9155 vs 0.6897 ms) and is excluded from the retained timing.
+See [quality evidence and limits](QUALITY.md#direct-expert-cache-reads-october-27-2026).
+
 ## Selector scheduling on newer LLVM (October 23, 2026)
 
 | Experiment | Outcome |

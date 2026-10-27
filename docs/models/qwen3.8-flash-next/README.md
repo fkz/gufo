@@ -189,6 +189,9 @@ The setting works with `serve llm` too. Unset it or set it to `0` to use the
 original eager upload. Invalid values and budgets too small for a complete
 layer fail explicitly. The error reports the minimum budget for this model.
 Keep the bound GGUF files available and unchanged throughout inference.
+Startup also prints the MiB required for all experts. If the budget fits all
+of them, loading uses the original resident layout and GPU graphs automatically;
+there is no LRU, workspace, or routing download overhead in that case.
 
 Each loaded model owns **one global LRU** keyed by `(layer, expert)`, shared by
 all its sessions and including MTP when loaded. Routed gate/up/down payloads
@@ -202,7 +205,7 @@ The reservation includes:
   the loaded layers. Mixed-precision layers therefore leave some slot padding;
   startup prints the actual slot count, not an estimate from Q4 parameter bits.
 - One reusable layer workspace, sized separately for the largest gate, up and
-  down tensors, with quantized-kernel tail padding.
+  down tensors, with quantized-kernel tail padding. This remains reserved for large prefill batches.
 - The upload pipeline's roughly 256 MiB of pinned SSD transfer buffers.
 
 KV cache, recurrent state, ordinary executor scratch, other model weights,
@@ -214,17 +217,28 @@ After routing, the cache pins every expert needed by that invocation, evicts
 least-recently-used unpinned entries, and reads misses through the bounded
 GGUF upload pipeline (unbuffered reads where supported). Prefill can pin all
 512 experts in one layer; the minimum budget guarantees this fits. Recency is
-touched in token-row/router-rank order. Separate executors serialize their
-expert workspace use, while a scheduled multi-session batch shares it.
+touched in token-row/router-rank order. GPU events order separate executors before slots or the shared workspace
+can be reused, while a scheduled multi-session batch shares its selected experts.
 
-This initial implementation preserves the existing routed kernels by copying
-selected cached weights into the reusable layer workspace. **Even hits incur a
-RAM/device-memory copy.** Miss reads can overlap the independent shared expert;
-routed projections wait for all required uploads. GPU graph replay is disabled
-with caching, and each expert invocation synchronizes before releasing the
-workspace. These costs can reduce throughput even with a high cache hit rate.
-No speed or numerical-parity qualification has been established for this
-experimental path yet.
+Decode and verification vector kernels read weights **directly from cache
+slots** through a small device pointer table. Hits transfer only routing IDs
+and pointers; they do not copy expert payloads or clear per-expert workspace
+tails. Slot padding is initialized only on misses. The existing quantized dot
+products, grouping, original expert IDs and output order are retained. Large
+prefill batches still copy selected weights into the reusable layer workspace
+for the tiled matrix kernels.
+
+Miss reads can overlap the independent shared expert; routed projections wait
+for their uploads. GPU graph replay remains disabled for an active LRU. A
+consumer event replaces the blocking synchronization at the end of each expert
+invocation, and the next routing download waits for that event before allowing
+eviction. The routing result still has to reach the CPU, so a partial LRU cache
+can remain slower than resident weights even with many hits.
+
+The focused GPU checks cover exact output equality with resident projections
+for Q4_K/Q5_K/Q5_1/Q8_0 and prequantized gate/up inputs, plus eviction,
+workspace fallback, peer-stream lifetime and failed I/O. These checks do not
+establish full-model numerical parity or end-to-end throughput.
 
 Normal model teardown logs cache hits, misses, and payload MiB read. Counts
 include prefill, drafts and verification, not just accepted output tokens.

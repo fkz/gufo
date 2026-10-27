@@ -9,7 +9,7 @@ template<bool single_request>
 __launch_bounds__(64) static __global__ void mul_mat_vec_moe_batch(
     const void* __restrict__ gate, const void* __restrict__ up,
     const block_q8_1* __restrict__ input, const int32_t* __restrict__ storage,
-    float* __restrict__ output, int k, int rows, int experts_used, int input_stride) {
+    float* __restrict__ output, int k, int rows, int experts_used, int input_stride, QfnExpertPointers pointers) {
   constexpr int tokens = MMVQ_MAX_BATCH_SIZE;
   const int count = storage[0];
   const int32_t* groups = storage + 1;
@@ -50,7 +50,9 @@ __launch_bounds__(64) static __global__ void mul_mat_vec_moe_batch(
       if (single_request ? active != 1 : active <= 1)
         continue;
     }
-    const void* weights = is_up ? up : gate;
+    const auto* table = is_up ? pointers.second : pointers.first;
+    const void* weights = table ? table[expert] : (is_up ? up : gate);
+    const int weight_expert = table ? 0 : expert;
     const int blocks_per_row = k / qk;
     uint32_t slots[columns];
 #pragma unroll
@@ -61,9 +63,9 @@ __launch_bounds__(64) static __global__ void mul_mat_vec_moe_batch(
       const int kqs = vdr * (lane % (qi / vdr));
       if constexpr (!single_request) {
         const Q4MoeFragment w0(
-            weights, (expert * rows + row0) * blocks_per_row + kb, kqs);
+            weights, (weight_expert * rows + row0) * blocks_per_row + kb, kqs);
         const Q4MoeFragment w1(
-            weights, (expert * rows + min(row0 + 1, rows - 1)) * blocks_per_row + kb,
+            weights, (weight_expert * rows + min(row0 + 1, rows - 1)) * blocks_per_row + kb,
             kqs);
 #pragma unroll
         for (int t = 0; t < columns; ++t) {
@@ -84,7 +86,7 @@ __launch_bounds__(64) static __global__ void mul_mat_vec_moe_batch(
                 weights,
                 input + token_row(single_request ? token : t) * input_stride +
                     kb * (qk / QK8_1),
-                (expert * rows + min(row0 + r, rows - 1)) * blocks_per_row + kb,
+                (weight_expert * rows + min(row0 + r, rows - 1)) * blocks_per_row + kb,
                 kqs);
         }
       }
@@ -129,12 +131,12 @@ void mul_mat_vec_moe_batch_wave64(const void* gate, const void* up,
                                  const block_q8_1* input, const int32_t* groups,
                                  float* output, int k, int rows,
                                  int experts_used, int input_stride,
-                                 hipStream_t stream) {
+                                 hipStream_t stream, QfnExpertPointers pointers) {
   const dim3 grid((rows + 1) / 2, 32);
   mul_mat_vec_moe_batch<false><<<grid, 64, 0, stream>>>(
-      gate, up, input, groups, output, k, rows, experts_used, input_stride);
+      gate, up, input, groups, output, k, rows, experts_used, input_stride, pointers);
   mul_mat_vec_moe_batch<true><<<grid, 64, 0, stream>>>(
-      gate, up, input, groups, output, k, rows, experts_used, input_stride);
+      gate, up, input, groups, output, k, rows, experts_used, input_stride, pointers);
 }
 
 }  // namespace qfn_mmq

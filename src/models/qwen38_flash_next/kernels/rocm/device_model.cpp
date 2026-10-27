@@ -7,6 +7,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <initializer_list>
+#include <iostream>
 #include <limits>
 #include <string_view>
 #include <utility>
@@ -398,6 +399,24 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       return nullptr;
     }
     cache_budget = static_cast<std::size_t>(mib) << 20;
+  }
+  if (cache_budget != 0) {
+    std::size_t full = 0;
+    const auto count = [&](const LayerWeights& l) {
+      full += l.ffn_gate_exps.SizeBytes() + l.ffn_up_exps.SizeBytes() +
+              l.ffn_down_exps.SizeBytes() + 3 * kTailMargin;
+    };
+    for (const auto& layer : w.layers)
+      count(layer);
+    if (mtp)
+      count(mtp->block);
+    std::cerr << "expert cache: full residency needs "
+              << (full + (1ULL << 20) - 1) / (1ULL << 20) << " MiB\n";
+    if (cache_budget >= full) {
+      std::cerr << "expert cache: budget fits all experts; using resident "
+                   "weights and GPU graphs\n";
+      cache_budget = 0;
+    }
   }
   std::unique_ptr<DeviceModel> m(new DeviceModel());
   m->config_ = w.config;

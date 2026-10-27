@@ -13,14 +13,16 @@
 #include <string>
 #include <vector>
 
+#include "src/core/hip/host_allocations.hpp"
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
-// Shared, byte-bounded LRU of unchanged GGUF expert payloads. Kernels use one
-// reusable layer workspace; a lease pins it until its stream has finished.
+// Shared, byte-bounded LRU of unchanged GGUF expert payloads. Decode reads
+// slots directly; prefill can use a reusable layer workspace. GPU events
+// protect slots, tables and workspace after a CPU lease is released.
 class ExpertCache {
 public:
   static std::unique_ptr<ExpertCache> Create(
@@ -37,7 +39,7 @@ public:
     ~Lease();
     // Called after shared-expert work is queued. Wait only for the routing
     // event, then overlap disk uploads with that independent GPU work.
-    bool Ready(std::string* error);
+    bool Ready(bool direct, std::string* error);
     bool Complete(bool success, std::string* error);
 
   private:
@@ -47,8 +49,7 @@ public:
     std::unique_lock<std::mutex> lock_;
     std::uint32_t layer_;
     hipStream_t stream_;
-    hipEvent_t routed_{nullptr};
-    std::vector<std::int32_t> ids_;
+    std::size_t count_{0};
     bool complete_{false};
   };
 
@@ -73,7 +74,7 @@ private:
   };
   bool Fail(const std::string& message, std::string* error);
   bool Prepare(std::uint32_t layer, std::span<const std::int32_t> ids,
-               hipStream_t stream, std::string* error);
+               hipStream_t stream, bool direct, std::string* error);
   std::mutex mutex_;
   std::unique_ptr<hip::WeightUpload> upload_;
   std::vector<Layer> layers_;
@@ -82,6 +83,13 @@ private:
   std::vector<std::size_t> slot_for_key_;
   std::array<void*, 3> workspace_{};
   void* storage_{nullptr};
+  const void** pointers_device_{nullptr};
+  hip::HostAllocations host_;
+  const void** pointers_host_{nullptr};
+  std::int32_t* ids_host_{nullptr};
+  std::size_t ids_capacity_{0};
+  hipEvent_t routed_{nullptr};
+  hipEvent_t consumed_{nullptr};
   std::size_t stride_{0};
   std::size_t bytes_{0};
   std::uint32_t experts_{0};
