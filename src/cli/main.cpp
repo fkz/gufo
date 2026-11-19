@@ -1,14 +1,21 @@
 #include <array>
 #include <iostream>
 #include <span>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "src/cli/banner.hpp"
 #include "src/cli/bench/bench.hpp"
+#include "src/cli/decide/decide.hpp"
 #include "src/cli/diagnose/diagnose.h"
 #include "src/cli/eval/eval.hpp"
+#include "src/cli/extension/extension.hpp"
+#include "src/cli/extension_diagnostics.hpp"
+#include "src/cli/model/model.hpp"
 #include "src/cli/prompt/prompt.hpp"
 #include "src/cli/serve/serve.hpp"
+#include "src/cli/speak/speak.hpp"
 #include "src/cli/transcribe/transcribe.hpp"
 #include "src/cli/video/video.hpp"
 
@@ -26,7 +33,8 @@ namespace {
 
 void print_version() {
   std::cout << "gufo version " << kGufoReleaseVersion << " (" << kGufoRevision
-            << ")\n";
+            << ")\n"
+            << gufo::cli::ExtensionDiagnostics(false);
 }
 
 void print_help(std::string_view program_name) {
@@ -41,8 +49,16 @@ void print_help(std::string_view program_name) {
       << "  bench          Benchmark prompt processing and token generation\n"
       << "  eval           Evaluate an OpenAI-compatible text server\n"
       << "  video          Generate MiniMax H3 text-to-video\n"
-      << "  transcribe     Transcribe WAV audio with Qwen3-ASR-1.7B\n"
+      << "  transcribe     Transcribe WAV audio with a speech recognition "
+         "model\n"
+      << "  speak          Synthesize speech or voice-chat with a speech "
+         "model\n"
+      << "  decide         Answer typed decision questions with a decision "
+         "model\n"
       << "  diagnose       Inspect system hardware, memory, and drivers\n"
+      << "  extension      Install, list, rebuild and remove extension "
+         "modules\n"
+      << "  model          Download, list, update and remove model weights\n"
       << "  help           Print help for a specific command\n\n"
       << "Run '" << program_name << " help <COMMAND>' or '" << program_name
       << " <COMMAND> --help' for details on a command\n\n"
@@ -107,6 +123,12 @@ int run(std::span<const char* const> args) {
     if (sub == "transcribe") {
       return gufo::cli::RunTranscribe(help_flag);
     }
+    if (sub == "speak") {
+      return gufo::cli::RunSpeak(help_flag);
+    }
+    if (sub == "decide") {
+      return gufo::cli::RunDecide(help_flag);
+    }
     if (sub == "chat") {
       return gufo::cli::RunChat(help_flag);
     }
@@ -127,6 +149,12 @@ int run(std::span<const char* const> args) {
     return gufo::cli::RunProbe(options.subspan(1));
   }
 
+  if (first_arg == "extension") {
+    return gufo::cli::RunExtension(options.subspan(1));
+  }
+  if (first_arg == "model") {
+    return gufo::cli::RunModel(options.subspan(1));
+  }
   if (first_arg == "diagnose") {
     return gufo::cli::RunDiagnose(options);
   }
@@ -149,6 +177,12 @@ int run(std::span<const char* const> args) {
 
   if (first_arg == "transcribe") {
     return gufo::cli::RunTranscribe(options.subspan(1));
+  }
+  if (first_arg == "speak") {
+    return gufo::cli::RunSpeak(options.subspan(1));
+  }
+  if (first_arg == "decide") {
+    return gufo::cli::RunDecide(options.subspan(1));
   }
 
   if (first_arg == "chat") {
@@ -173,6 +207,18 @@ int run(std::span<const char* const> args) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  const std::span<const char* const> args(argv, static_cast<std::size_t>(argc));
-  return run(args);
+  const std::span<const char* const> raw(argv, static_cast<std::size_t>(argc));
+  // `--model <id>` names an installed model; commands receive its path.
+  std::vector<std::string> resolved;
+  try {
+    resolved = gufo::cli::ResolveModelArguments(raw);
+  } catch (const std::exception& error) {
+    std::cerr << "Error: " << error.what() << "\n";
+    return 1;
+  }
+  std::vector<const char*> pointers;
+  pointers.reserve(resolved.size());
+  for (const auto& arg : resolved)
+    pointers.push_back(arg.c_str());
+  return run(pointers);
 }

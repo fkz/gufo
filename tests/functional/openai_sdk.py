@@ -21,6 +21,7 @@ from typing import Literal
 import zlib
 from urllib.parse import urlsplit
 
+import httpx
 import openai
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient, DefaultHttpxClient, OpenAI
 from openai.types import Completion, CompletionChoice
@@ -28,11 +29,12 @@ from metrics import CaseComplete, Recorder
 from tool_reasoning import check_reasoning_separator, check_tool_reasoning, response_result
 from tool_streaming import check_tool_streaming
 from discovery import check_discovery
+from logprobs import check_logprobs, check_responses_logprobs
 from image_inputs import check_image_count, check_image_detail, check_image_inputs
 from tool_images import check_tool_images
 from tool_choice import check_tool_choice_cache
 from tool_parameter_order import check_tool_parameter_order
-from tool_native import check_finite_argument_types, check_native_tool_schemas
+from tool_native import check_finite_argument_types, check_native_tool_schemas, check_tool_type_unions
 from tool_agent import (check_tool_agent, check_tool_agent_loop, check_tool_history,
                         check_untyped_agent_tools, check_mixed_tool_schemas,
                         check_tool_schema_edges)
@@ -44,10 +46,12 @@ from cache_compaction import check_cache_compaction
 from cache_workloads import check_cache_transforms, check_cache_pressure
 from cache_messages_loop import check_cache_messages_loop
 from system_injection import check_system_injection
+from suites import NOT_IN_ALL, SDK_SUITES, VISION
 from cache_growth import check_cache_growth, check_unchanged_retry, log_offset
 from messages_tools import check_messages_tools
 from reasoning_budget import check_reasoning_budget
 from messages_count_tokens import check_messages_count_tokens, check_messages_image_counts
+from openai_count_tokens import check_openai_count_tokens
 from cache_depth import check_cache_depth
 from cache_stalls import check_cache_stalls
 from cache_rotation import check_cache_rotation
@@ -308,9 +312,36 @@ def image_content(color):
     }
 
 
+# What /props reports in default_generation_settings.params, by request field.
+PROVIDER_SAMPLING = ("temperature", "top_p", "presence_penalty", "frequency_penalty",
+                     "top_k", "min_p", "repeat_penalty", "repeat_last_n")
+
+
+def provider_sampling(base_url):
+    """The served model's own defaults, for a model without an in-tree preset.
+
+    /props reports them for the server's default thinking mode; the suite
+    expects the same values with thinking on and off.
+    """
+    root = base_url.rstrip("/").removesuffix("/v1")
+    with httpx.Client(trust_env=False, timeout=30) as http:
+        response = http.get(root + "/props")
+    response.raise_for_status()
+    params = response.json()["default_generation_settings"]["params"]
+    return {key: params[key] for key in PROVIDER_SAMPLING}
+
+
 def check_sampling_defaults(client, model, checks, preset, overrides, vision=False,
-                            server_thinking=None):
-    """Omission and explicit presets must replay within each execution mode."""
+                            server_thinking=None, provider=None):
+    """Omission and explicit presets must replay within each execution mode.
+
+    With the provider preset, `provider` holds the defaults the server reports
+    (see provider_sampling); the in-tree presets keep independent values.
+    """
+    if (preset == "provider") != (provider is not None):
+        raise ValueError("pass the reported defaults with, and only with, the provider preset")
+    if provider is not None:
+        checks["provider_sampling_defaults"] = provider
     def signature(value):
         return value["text"].strip(), value["reasoning"].strip(), value["finish"]
 
@@ -330,7 +361,12 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
             "extra_body": {"cache_prompt": False},
         }
         default = chat_result(client, request)
-        explicit = chat_result(client, {**request, "reasoning_effort": effort}, True)
+        # No preset names another model's default effort; its thinking mode
+        # is still explicit.
+        written = ({"extra_body": {**request["extra_body"],
+                                   "chat_template_kwargs": {"enable_thinking": thinking}}}
+                   if provider is not None else {"reasoning_effort": effort})
+        explicit = chat_result(client, {**request, **written}, True)
         assert bool(default["reasoning"]) == thinking, default
         assert signature(default) == signature(explicit), (default, explicit)
         record("default_thinking_effort", default)
@@ -352,8 +388,13 @@ def check_sampling_defaults(client, model, checks, preset, overrides, vision=Fal
                   "min_p": 0., "min_keep": 0, "repeat_penalty": 1.,
                   "repeat_last_n": 64}
         assert overrides.keys() <= (expected.keys() | native.keys()), overrides
+        if provider is not None:
+            # /props omits min_keep; it is left unwritten unless overridden.
+            expected.update({key: provider[key] for key in expected if key in provider})
+            native = {key: provider[key] for key in native if key in provider}
         expected.update({key: value for key, value in overrides.items() if key in expected})
-        native.update({key: value for key, value in overrides.items() if key in native})
+        native.update({key: value for key, value in overrides.items()
+                       if key in native or key == "min_keep"})
         # A server seeded from entropy has no replay contract until a request
         # supplies a seed. Still test that explicit request seed overrides -1.
         inherited_seed = "seed" in overrides and overrides["seed"] >= 0
@@ -1204,6 +1245,26 @@ def check_structured_outputs(client, model, checks, vision=False):
     result = chat_result(client, unbounded, True)
     assert result["finish"] == "stop" and json.loads(result["text"]) == {"numbers": [1, 2]}, result
     record("schema_unbounded_array", result)
+
+    # The Vercel AI SDK always declares the dialect and keeps annotations
+    # (#1057); they describe the schema without constraining the reply.
+    annotated = {
+        **common,
+        "messages": [{"role": "user", "content": "Greet me and label the sentiment neutral."}],
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "Greeting", "strict": True, "schema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "$comment": "generated", "type": "object", "properties": {
+                    "greeting": {"type": "string", "default": "hi", "examples": ["hello"]},
+                    "sentiment": {"type": "string", "enum": ["positive", "negative", "neutral"],
+                                  "deprecated": False}},
+                "required": ["greeting", "sentiment"], "additionalProperties": False}}},
+    }
+    result = chat_result(client, annotated, True)
+    reply = json.loads(result["text"])
+    assert result["finish"] == "stop" and set(reply) == {"greeting", "sentiment"}, result
+    assert isinstance(reply["greeting"], str) and reply["sentiment"] == "neutral", result
+    record("schema_annotations", result)
 
     def constant(text):
         return {"type": "json_schema", "json_schema": {"name": "constant", "strict": True,
@@ -2092,18 +2153,19 @@ def check_auto_tools(client, model, checks, vision=False):
     assert json.loads(calls[0].arguments) == {"value": 7}, result
     record("auto_many_declared_tools", result.to_dict())
     if vision:
+        # The argument stop below requires a color name, not an RGB/hex code.
+        image_prompt = ("Call record with value equal to the image color as a lowercase "
+                        "English color name, not a hex or RGB code. Omit optional.")
         result = client.responses.create(**{
             **response_request, "temperature": 0,
             "input": [{"role": "user", "content": [
-                {"type": "input_text", "text":
-                 "Call record with value equal to the image color. Omit optional."},
+                {"type": "input_text", "text": image_prompt},
                 {"type": "input_image", "image_url":
                  image_content("blue")["image_url"]["url"]}]}]})
         response_signature(result, value="blue")
         record("auto_image_tool", result.to_dict())
         image_request = {**common, "messages": [{"role": "user", "content": [
-            image_content("blue"), {"type": "text", "text":
-            "Call record with value equal to the image color. Omit optional."}]}]}
+            image_content("blue"), {"type": "text", "text": image_prompt}]}]}
         stopped = chat_result(client, {**image_request, "stop": "blue"}, True)
         assert stopped["finish"] == "stop" and not stopped["tools"], stopped
         retry = chat_result(client, image_request, True)
@@ -2567,11 +2629,16 @@ def check_prompt_progress(client, model, checks, width, vision, allow_missing, s
 def check_server_metrics(client, model, checks, width, context, speculative, server_log=None):
     from server_metrics import (ServerMetrics, assert_accounting, PROMPT, GENERATED,
                                 PROCESSING, DEFERRED, PROMPT_SPEED, GENERATED_SPEED,
-                                KV_USAGE, DRAFT_ROUNDS, DRAFTS, ACCEPTED, assert_slots)
+                                KV_USAGE, DRAFT_ROUNDS, DRAFTS, ACCEPTED, assert_slots,
+                                PROMPT_BUDGET, PROMPT_AVAILABLE)
 
     metrics = ServerMetrics(client.base_url)
     initial = metrics.idle()
-    assert metrics.read("/v1/metrics") == initial
+    alias = metrics.read("/v1/metrics")
+    # Live host headroom may change between otherwise idle scrapes.
+    volatile = {PROMPT_BUDGET, PROMPT_AVAILABLE}
+    assert {k: v for k, v in alias.items() if k not in volatile} == {
+        k: v for k, v in initial.items() if k not in volatile}
     def slots(path="/slots", *, idle=False):
         snapshot = metrics.slots(path)
         assert_slots(snapshot, width, model, context, speculative != "off")
@@ -2754,11 +2821,6 @@ def check_server_metrics(client, model, checks, width, context, speculative, ser
     assert proposed > 0 if speculative != "off" else proposed == 0, final
 
 
-SDK_SUITES = ("discovery", "messages-count-tokens", "messages-image-counts", "responses", "stops", "conversation", "image-inputs", "image-count", "tool-images", "image-detail", "structured", "structured-limits",
-              "tool-reasoning", "tool-streaming", "reasoning-separator", "reasoning-budget",
-              "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "messages-tools", "tool-untyped", "tool-mixed", "tool-native-schemas", "tool-native-types", "tool-choice-cache", "tool-parameter-order", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
-              "long-context", "state-edges", "progress", "stream-start", "prefill-scheduling", "metrics", "cache-edits", "cache-growth", "cache-depth", "cache-rotation", "cache-concurrency", "cache-shared-prefix",
-              "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "system-injection")
 
 
 def main():
@@ -2773,8 +2835,9 @@ def main():
     parser.add_argument("--suite", choices=("all", *SDK_SUITES), default="all")
     parser.add_argument("--vision", action="store_true",
                         help="Add image checks; the server needs its matching --mmproj")
-    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4"),
-                        help="Expected text defaults; required for all/sampling-defaults")
+    parser.add_argument("--sampling-preset", choices=("qwen38", "deepseek4", "provider"),
+                        help="Expected text defaults; required for all/sampling-defaults. "
+                             "provider reads the served model's own from /props")
     parser.add_argument("--sampling-overrides", type=json.loads, default={},
                         help="JSON object of explicit server sampling CLI values")
     parser.add_argument("--server-thinking", choices=("on", "off"),
@@ -2795,8 +2858,8 @@ def main():
     parser.add_argument("--server-log", type=Path,
                         help="Server log; shows retry copies refused under memory pressure")
     args = parser.parse_args()
-    if args.suite in ("discovery", "messages-image-counts", "all") and args.expected_input_modalities is None:
-        parser.error("discovery and messages-image-counts require --expected-input-modalities text or text,image")
+    if args.suite in ("discovery", "openai-count-tokens", "messages-image-counts", "all") and args.expected_input_modalities is None:
+        parser.error("discovery, openai-count-tokens and messages-image-counts require --expected-input-modalities text or text,image")
     if args.suite in ("image-inputs", "image-count", "tool-images", "image-detail") and not args.vision:
         parser.error("image-inputs, image-count, tool-images, and image-detail require --vision and a loaded projector")
     if args.suite in ("all", "sampling-defaults") and not args.sampling_preset:
@@ -2839,6 +2902,9 @@ def main():
                                      "response": [recorder.response_hook]}
     )) as client:
         suites = {
+            "openai-count-tokens": lambda: check_openai_count_tokens(
+                client, args.model, checks, args.context, image_content,
+                args.expected_input_modalities.split(",")),
             "messages-count-tokens": lambda: check_messages_count_tokens(
                 client, args.model, checks, args.context),
             "messages-image-counts": lambda: check_messages_image_counts(
@@ -2896,13 +2962,18 @@ def main():
                 client, args.model, checks, chat_result, args.server_log),
             "tool-parameter-order": lambda: check_tool_parameter_order(
                 client, args.model, checks, chat_result),
+            "tool-type-unions": lambda: check_tool_type_unions(
+                client, args.model, checks, chat_result),
             "tool-schema-edges": lambda: check_tool_schema_edges(
                 client, args.model, checks, chat_result, args.vision, image_content, args.server_log),
             "state-edges": lambda: check_state_edges(
                 client, args.model, checks, args.speculative, args.vision, args.server_log),
             "sampling-defaults": lambda: check_sampling_defaults(
                 client, args.model, checks, args.sampling_preset, args.sampling_overrides,
-                args.vision, args.server_thinking),
+                args.vision, args.server_thinking,
+                provider_sampling(args.base_url) if args.sampling_preset == "provider" else None),
+            "logprobs": lambda: check_logprobs(client, args.model, checks, CompletionStreamFrame),
+            "responses-logprobs": lambda: check_responses_logprobs(client, args.model, checks),
             "sampling-ranges": lambda: check_sampling_ranges(client, args.model, checks),
             "batch": lambda: check_batches(
                 client, args.model, checks, args.concurrency, args.vision, args.speculative),
@@ -2945,12 +3016,12 @@ def main():
             "system-injection": lambda: check_system_injection(
                 client, args.model, checks, chat_result),
         }
-        selected = ([name for name in suites if name not in ("tool-native-types", "cache-bridge", "cache-compaction", "cache-transforms", "cache-pressure", "cache-messages-loop", "cache-stalls", "prefill-scheduling")
-                     and (name not in ("image-inputs", "image-count", "tool-images", "image-detail") or args.vision)]
+        selected = ([name for name in suites if name not in ("tool-native-types", *NOT_IN_ALL)
+                     and (name not in VISION or args.vision)]
                     if args.suite == "all" else
                     ["native-tools", "auto-tools"] if args.suite == "tools" else [args.suite])
         for name in selected:
-            started = time.monotonic()
+            started = time.perf_counter()
             try:
                 suites[name]()
                 report["suites"][name] = {"status": "passed"}
@@ -2964,7 +3035,7 @@ def main():
                 report["status"] = "interrupted"
                 checks.save()
                 raise
-            report["suites"][name]["seconds"] = round(time.monotonic() - started, 3)
+            report["suites"][name]["seconds"] = round(time.perf_counter() - started, 3)
             checks.save()
             if args.through_case and args.through_case in checks:
                 break

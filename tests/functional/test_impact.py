@@ -15,12 +15,28 @@ import impact
 HERE = Path(__file__).resolve().parent
 
 
+class RegistryTest(unittest.TestCase):
+    def test_every_sdk_suite_has_a_dispatch_entry(self):
+        import ast
+        import suites
+        tables = [{key.value for key in node.keys if isinstance(key, ast.Constant)}
+                  for node in ast.walk(ast.parse((HERE / "openai_sdk.py").read_text()))
+                  if isinstance(node, ast.Dict)]
+        dispatch = max(tables, key=len)
+        # `tools` dispatches as native-tools plus auto-tools.
+        self.assertEqual(set(suites.SDK_SUITES) - dispatch, {"tools"})
+        self.assertLessEqual({"native-tools", "auto-tools"}, dispatch)
+        self.assertLessEqual(set(suites.INCLUDED_IN) | set(suites.INCLUDED_IN.values()) | set(suites.MIN_CONTEXT)
+                             | set(suites.NEEDS_CACHE_RAM) | set(suites.NOT_IN_ALL) | set(suites.VISION),
+                             set(suites.SUITES))
+
+
 class ImpactTest(unittest.TestCase):
     def setUp(self):
         self.manifest = json.loads((HERE / "impact.json").read_text())
 
     def test_registry_must_be_complete(self):
-        names = impact.suite_names(HERE / "run.py")
+        names = impact.suite_names(HERE / "suites.py")
         impact.validate(self.manifest, names)
         with self.assertRaises(ValueError):
             impact.validate(self.manifest, [*names, "new-suite"])
@@ -34,7 +50,7 @@ class ImpactTest(unittest.TestCase):
         self.assertLessEqual({"cache", "long-context", "cache-edits", "discovery", "state-edges"}, names)
 
     def test_shared_qwen_is_not_private_qwen27(self):
-        result = impact.plan(self.manifest, ["src/models/qwen/tokenizer.cpp"])
+        result = impact.plan(self.manifest, ["src/families/qwen/text/tokenizer.cpp"])
         profiles = {row["profile"] for row in result["selected"]}
         self.assertIn("flash-next-q4/mtp", profiles)
         self.assertIn("qwen27-q8/dflash2", profiles)
@@ -58,7 +74,7 @@ class ImpactTest(unittest.TestCase):
         self.assertEqual(result["timing_qualification"], "not performed; candidate correctness only")
 
     def test_docs_select_nothing_but_graph_changes_expand(self):
-        self.assertFalse(impact.plan(self.manifest, ["docs/SERVER.md"])["groups"])
+        self.assertFalse(impact.plan(self.manifest, ["docs/server.md"])["groups"])
         self.assertTrue(impact.plan(self.manifest, ["tests/functional/impact.json"])["groups"])
 
     def test_deleted_and_renamed_paths_are_retained(self):
@@ -85,7 +101,7 @@ class ImpactTest(unittest.TestCase):
         bad = copy.deepcopy(self.manifest)
         bad["rules"][0]["affects"] = ["typo"]
         with self.assertRaises(ValueError):
-            impact.validate(bad, impact.suite_names(HERE / "run.py"))
+            impact.validate(bad, impact.suite_names(HERE / "suites.py"))
         with self.assertRaises(ValueError):
             impact.plan(self.manifest, [], ["typo"])
 
@@ -126,9 +142,9 @@ class ImpactTest(unittest.TestCase):
         broken = copy.deepcopy(self.manifest)
         broken["suites"]["discovery"]["escalate"] = ["src/**"]
         with self.assertRaises(ValueError):
-            impact.validate(broken, impact.suite_names(HERE / "run.py"))
+            impact.validate(broken, impact.suite_names(HERE / "suites.py"))
 
-    def test_executor_passes_the_plan_tier(self):
+    def test_executor_reports_the_plan_tier(self):
         plan = impact.plan(self.manifest, ["src/cli/serve/openai_chat.cpp"],
                            ["flash-next-q4/mtp"], "pr")
         with tempfile.TemporaryDirectory() as directory, patch.dict("os.environ", {}, clear=True):
@@ -139,8 +155,8 @@ class ImpactTest(unittest.TestCase):
             report = json.loads((output / "summary.json").read_text())
         self.assertEqual(report["tier"], "pr")
         self.assertTrue(report["release_only"])
-        args = report["groups"][0]["command"]
-        self.assertEqual(args[args.index("--tier") + 1], "pr")
+        # Every tier runs the same transport rotation; the runner takes no tier.
+        self.assertNotIn("--tier", report["groups"][0]["command"])
 
     def test_executor_retains_failed_groups_and_runs_both_modes(self):
         plan = impact.plan(self.manifest, ["src/models/qwen38_flash_next/engine.cpp"], ["flash-next-q4"])

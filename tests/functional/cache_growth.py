@@ -7,6 +7,9 @@ import sys
 # The assistant opening after a stable boundary, such as Qwen's
 # `<|im_start|>assistant\n<think>\n`, is a few tokens long.
 ASSISTANT_OPENING_TOKENS = 16
+# The largest TextRunnerCapabilities::prefill_alignment in tree (Flash-Next's
+# selection block). Such a runner rounds the stable boundary down to it.
+PREFILL_ALIGNMENT = 4
 
 
 def log_offset(server_log):
@@ -25,23 +28,32 @@ def retry_copy_refused(server_log, start, end, prompt_tokens):
                        rf"bytes=\d+ tokens={prompt_tokens} ", window)
     component = re.search(r"schema=component-cache-v1 event=capture_refused "
                           rf"reason=(?:byte|entry)_capacity tokens={prompt_tokens}(?:\s|$)", window)
-    return legacy is not None or component is not None
+    # Retention admission refuses a copy once every record or byte is taken:
+    # action=1 is refused, reason=1 byte and reason=2 record capacity
+    # (src/cache/retention.hpp).
+    admission = re.search(r"schema=component-cache-v1 event=retention action=1 "
+                          rf"reason=[12] tokens={prompt_tokens}(?:\s|$)", window)
+    return legacy is not None or component is not None or admission is not None
 
 
 def check_unchanged_retry(label, retry, prefilled, server_log, start, end, *,
                           mutable_suffix_tokens=ASSISTANT_OPENING_TOKENS):
     """An unchanged retry reuses the complete prompt. Under memory pressure the
     previous request's complete-prompt copy is refused rather than displace
-    another conversation's last checkpoint (docs/KV-CACHE.md); the retry then
+    another conversation's last checkpoint (docs/internal/cache.md); the retry then
     restores the stable boundary and prefills only the mutable suffix. For
     agent histories that includes the last user turn; its bound is measured
-    separately with the count-tokens endpoint, not padded with extra slack."""
+    separately with the count-tokens endpoint, not padded with extra slack.
+    An aligned runner may instead restore exactly the boundary rounded down to
+    its prefill alignment, replaying up to three more tokens."""
     if not prefilled:
         return
     usage = retry["usage"]
     total = usage.get("prompt_tokens", usage.get("input_tokens"))
     assert type(mutable_suffix_tokens) is int and mutable_suffix_tokens > 0
-    assert prefilled <= mutable_suffix_tokens and \
+    boundary = total - mutable_suffix_tokens
+    aligned_suffix = total - (boundary - boundary % PREFILL_ALIGNMENT)
+    assert (prefilled <= mutable_suffix_tokens or prefilled == aligned_suffix) and \
         retry_copy_refused(server_log, start, end, total), retry
     print(f"NOTE {label}: retry copy refused under memory pressure; "
           f"prefilled {prefilled} of {total} tokens", file=sys.stderr, flush=True)
@@ -86,7 +98,7 @@ def check_cache_growth(client, model, checks, chat_result, server_log=None):
             return (result["text"], result["tools"], result["finish"],
                     bool(result["reasoning"].strip()))
 
-        history = []
+        history, astray = [], []
         previous_total = previous_reused = 0
         for turn in range(4):
             messages.append({"role": "user", "content": f"Turn {turn}.\n" +
@@ -98,9 +110,13 @@ def check_cache_growth(client, model, checks, chat_result, server_log=None):
             before_last = log_offset(server_log)
             result = chat(f"turn_{turn}", body)
             total, reused, prefilled = work(result)
-            assert result["text"].strip() == "BETA" and not result["tools"] \
-                and result["finish"] == "stop", result
+            assert not result["tools"] and result["finish"] == "stop", result
             assert bool(result["reasoning"].strip()) == thinking, result
+            # DeepSeek can miss the answer uncached too (third drop_reasoning
+            # turn: "responseBETA" in unclosed reasoning, #670). Such a turn
+            # gets its own cold control and must match it.
+            if result["text"].strip() != "BETA":
+                astray.append(turn)
             if turn == 0:
                 assert total >= 2048 and reused == 0 and prefilled == total, result
             else:
@@ -131,7 +147,10 @@ def check_cache_growth(client, model, checks, chat_result, server_log=None):
 
         # Measure the whole growing history before cold controls can supply
         # missing checkpoints and accidentally hide a frozen-cache failure.
+        # The deepest turn's control renders every earlier turn too.
         for turn, (body, warm) in enumerate(history):
+            if turn not in astray and turn != len(history) - 1:
+                continue
             body["extra_body"]["cache_prompt"] = False
             cold = chat(f"cold_control_{turn}", body)
             total = warm["usage"]["prompt_tokens"]
@@ -190,6 +209,25 @@ def check_messages_growth(client, model, checks, chat_result, failures, server_l
             print(f"CHECK {label}_{phase}", file=sys.stderr, flush=True)
             return result
 
+        def renders_thinking(body):
+            # Count the prompt with and without the replayed thinking blocks,
+            # once: the template's policy does not change between turns.
+            if not thinking:
+                return False
+            if label + "_renders_thinking" in checks:
+                return checks[label + "_renders_thinking"]
+            stripped = deepcopy(body)
+            for message in stripped["messages"]:
+                if message["role"] == "assistant":
+                    message["content"] = [block for block in message["content"]
+                                          if block["type"] != "thinking"]
+            count = lambda request: client.post(  # noqa: E731
+                "/messages/count_tokens", cast_to=object, body={
+                    key: request[key] for key in ("model", "system", "messages", "thinking")}
+            )["input_tokens"]
+            checks[label + "_renders_thinking"] = rendered = count(body) != count(stripped)
+            return rendered
+
         history = []
         previous_total = previous_completion = 0
         for turn in range(4):
@@ -206,7 +244,11 @@ def check_messages_growth(client, model, checks, chat_result, failures, server_l
                 assert total > previous_total, (total, previous_total)
                 # An unchanged replay reproduces the generated assistant turn,
                 # so reuse must reach past the previous prompt into that turn.
-                floor = previous_total + (previous_completion // 2 if thinking else -16)
+                # A template that drops earlier turns' thinking (DeepSeek V4,
+                # #670) renders a different turn; reuse then stops at the
+                # previous prompt, as it does without thinking.
+                floor = previous_total + (previous_completion // 2
+                                          if renders_thinking(body) else -16)
                 if reused < floor:
                     failures.append(
                         f"{label}_turn_{turn}: cache did not cover the replayed turn: "
@@ -226,9 +268,10 @@ def check_messages_growth(client, model, checks, chat_result, failures, server_l
         assert (retry["text"], retry["reasoning"]) == \
             (history[-1][1]["text"], history[-1][1]["reasoning"]), retry
 
-        # Uncached Chat Completions controls render the same conversation; equal
-        # prompt sizes show both routes produce the same prompt.
-        for turn, (body, warm) in enumerate(history):
+        # An uncached Chat Completions control renders the same conversation;
+        # equal prompt sizes show both routes produce the same prompt. The
+        # deepest turn holds every earlier message.
+        for turn, (body, warm) in list(enumerate(history))[-1:]:
             chat = [{"role": "system", "content": system}]
             for message in body["messages"]:
                 if message["role"] == "user":

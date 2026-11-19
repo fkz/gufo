@@ -297,6 +297,84 @@ void CheckYarnPhase(float factor, std::uint32_t position) {
             << ": HF angle and mscale\n";
 }
 
+// Dynamic YaRN: keys written under one factor and re-rotated to another must
+// match the keys written under the target factor at every position, past the
+// native context too. The cache holds F16 keys, so a re-rotation rounds once
+// more than a direct write: each value may differ by one F16 ulp of its
+// pair's magnitude. Dimensions past the rotary ones keep their bits.
+// Writes keys at path.front(), re-rotates through every later factor, and
+// compares with keys written directly at path.back(). From `first` on, the last
+// hop runs out of place, as a cache capture does.
+void CheckRerotation(const std::vector<float>& path, std::uint32_t rows,
+                     std::uint32_t first = 0) {
+  const auto rope_for = [](float factor) {
+    return factor == 1.0F ? qfn::YarnRope{} : Yarn(factor);
+  };
+  const std::size_t count = std::size_t{rows} * kKvWidth;
+  HipBuffer<float> source(count), work(count);
+  HipBuffer<__half> rotated(count), expected(count);
+  HipBuffer<std::uint32_t> pos(1);
+  Upload(&source, MakeValues(count, 0xC0FFEE, 1.0F));
+  Upload(&pos, std::vector<std::uint32_t>{0});
+  const auto write = [&](float factor, HipBuffer<__half>* cache) {
+    CheckHip(hipMemcpy(work.get(), source.get(), source.bytes(),
+                       hipMemcpyDeviceToDevice),
+             "re-rotation input");
+    q::Rope(work.get(), rows, kKvHeads, kDim, 64, pos.get(), 1e7F, nullptr,
+            nullptr, rope_for(factor));
+    q::StoreKv(work.get(), cache->get(), rows, kKvWidth, pos.get(), nullptr);
+  };
+  write(path.front(), &rotated);
+  write(path.back(), &expected);
+  for (std::size_t hop = 1; hop + 1 < path.size(); ++hop)
+    q::RerotateKeys(rotated.get(), rotated.get(), 0, rows, kKvHeads, kDim, 64,
+                    1, 1e7F, nullptr, rope_for(path[hop - 1]),
+                    rope_for(path[hop]), nullptr);
+  const std::size_t skipped = std::size_t{first} * kKvWidth;
+  HipBuffer<__half> last(count);
+  q::RerotateKeys(rotated.get() + skipped, last.get(), first, rows - first,
+                  kKvHeads, kDim, 64, 1, 1e7F, nullptr,
+                  rope_for(path[path.size() - 2]), rope_for(path.back()),
+                  nullptr);
+  CheckHip(hipDeviceSynchronize(), "re-rotation");
+  std::vector<__half> got(count - skipped), want(count);
+  CheckHip(hipMemcpy(got.data(), last.get(), got.size() * sizeof(__half),
+                     hipMemcpyDeviceToHost),
+           "re-rotated keys");
+  CheckHip(hipMemcpy(want.data(), expected.get(), expected.bytes(),
+                     hipMemcpyDeviceToHost),
+           "directly written keys");
+  double worst = 0.0;
+  const double bound = static_cast<double>(path.size() - 1);
+  for (std::size_t i = skipped; i < count; ++i) {
+    const std::uint32_t dim = i % kDim;
+    if (dim >= 64) {
+      if (std::memcmp(&got[i - skipped], &want[i], sizeof(__half)) != 0)
+        throw std::runtime_error("re-rotation changed a non-rotary dimension");
+      continue;
+    }
+    const std::size_t lo = dim < 32 ? i : i - 32;
+    const float magnitude = std::hypot(static_cast<float>(want[lo]),
+                                       static_cast<float>(want[lo + 32]));
+    const float ulp = std::ldexp(
+        1.0F,
+        std::max(std::ilogb(std::max(magnitude, 6.1035156e-5F)) - 10, -24));
+    const double error = std::fabs(static_cast<float>(got[i - skipped]) -
+                                   static_cast<float>(want[i])) /
+                         ulp;
+    worst = std::max(worst, error);
+    if (error > bound) {
+      throw std::runtime_error(
+          "re-rotated key differs from a direct write: position " +
+          std::to_string(i / kKvWidth) + " dim " + std::to_string(dim) + ", " +
+          std::to_string(error) + " ulp");
+    }
+  }
+  std::cout << "dynamic YaRN re-rotation " << path.front() << " -> "
+            << path.back() << " in " << path.size() - 1 << " hops over " << rows
+            << " positions: within " << worst << " F16 ulp of each pair\n";
+}
+
 // mRoPE: pair i reads T, H or W exactly as qwen::vision::RopePosition does.
 void CheckYarnVisionPhase(float factor) {
   const std::vector<std::int32_t> thw{300000, 200000, 250000};
@@ -809,6 +887,181 @@ void CheckLists(std::uint32_t n_tokens, std::uint32_t start_pos,
   std::cout << " bitwise-equal\n";
 }
 
+// The position is a device value while the host sizes the mask rows. A
+// position past a row must attend as if the blocks after it were not
+// selected, without reading the words that follow the row.
+void CheckPositionPastMask() {
+  constexpr std::uint32_t kBudget = 512;
+  constexpr std::uint32_t mask_words = 20, start_pos = 4 * 32 * 26 + 2;
+  constexpr std::uint32_t wide_words = 32, guard = 64;
+  constexpr std::uint32_t n_kv = start_pos + 1;
+  const std::size_t kv_count = static_cast<std::size_t>(n_kv) * kKvWidth;
+  const auto qv = MakeValues(kQWidth, 0x9A5C0DE5U, 4.0F);
+  std::vector<__half> kh(kv_count);
+  std::vector<__half> vh(kv_count);
+  {
+    const auto kf = MakeValues(kv_count, 0x6B1D7A11U, 1.0F);
+    const auto vf = MakeValues(kv_count, 0x1F00D5EDU, 1.0F);
+    for (std::size_t i = 0; i < kv_count; ++i) {
+      kh[i] = __float2half(kf[i]);
+      vh[i] = __float2half(vf[i]);
+    }
+  }
+  // Every fourth block of the row is selected. Past the row, the narrow
+  // mask is followed by guard words that would select every block; the
+  // wide mask selects none of them.
+  std::vector<std::uint32_t> narrow(mask_words + guard, 0xFFFFFFFFU);
+  std::vector<std::uint32_t> wide(wide_words, 0U);
+  for (std::uint32_t w = 0; w < mask_words; ++w)
+    narrow[w] = wide[w] = 0x11111111U;
+  HipBuffer<float> d_q(kQWidth);
+  HipBuffer<__half> d_k(kv_count);
+  HipBuffer<__half> d_v(kv_count);
+  HipBuffer<std::uint32_t> d_narrow(narrow.size());
+  HipBuffer<std::uint32_t> d_wide(wide.size());
+  HipBuffer<std::uint32_t> d_pos(1);
+  HipBuffer<std::uint32_t> d_lists(kBudget);
+  HipBuffer<std::uint32_t> d_counts(1);
+  Upload(&d_q, qv);
+  Upload(&d_k, kh);
+  Upload(&d_v, vh);
+  Upload(&d_narrow, narrow);
+  Upload(&d_wide, wide);
+  Upload(&d_pos, std::vector<std::uint32_t>{start_pos});
+  for (const std::uint32_t splits : {0U, 8U}) {
+    HipBuffer<float> d_partials(static_cast<std::size_t>(kHeads) *
+                                std::max(splits, 1U) * (kDim + 2));
+    float* partials = splits == 0 ? nullptr : d_partials.get();
+    const auto attend = [&](HipBuffer<std::uint32_t>& mask, std::uint32_t words,
+                            bool lists) {
+      HipBuffer<float> d_out(kQWidth);
+      q::Attention(d_q.get(), d_k.get(), d_v.get(), mask.get(), words,
+                   d_out.get(), partials, splits, 1, d_pos.get(), kHeads,
+                   kKvHeads, kDim, kRatio, nullptr,
+                   lists ? d_lists.get() : nullptr,
+                   lists ? d_counts.get() : nullptr, lists ? kBudget : 0);
+      CheckHip(hipDeviceSynchronize(), "attention past the mask row");
+      return Download(&d_out, kQWidth);
+    };
+    const auto reference = attend(d_wide, wide_words, false);
+    for (const bool lists : {false, true}) {
+      const auto out = attend(d_narrow, mask_words, lists);
+      if (std::memcmp(out.data(), reference.data(), kQWidth * sizeof(float)) !=
+          0)
+        throw std::runtime_error(std::string("attention read past its mask "
+                                             "row: ") +
+                                 (lists ? "lists" : "walk") +
+                                 " splits=" + std::to_string(splits));
+    }
+  }
+  std::cout << "attention past " << mask_words * 32
+            << " mask bits: walk and lists ignore the following words\n";
+}
+
+/// A decode or verification row's context must not depend on the chain it
+/// is computed in. A query before the 2048-token budget sweeps its keys
+/// densely when decoded alone (no mask); a chain that crosses the budget
+/// passes the selector's mask, which marks every block of such rows. The
+/// mask walk attends the incomplete tail block in a tile of its own, so the
+/// launcher must keep those rows on the dense sweep. Compares every row of
+/// chains starting at 2040..2047 (one launch, eight splits, compact lists)
+/// bit for bit against the same row launched alone, and checks that the
+/// mask walk would have differed.
+void CheckBudgetRows(std::uint32_t seed) {
+  constexpr std::uint32_t kBudget = 512;
+  constexpr std::uint32_t kTopK = kBudget * kRatio;
+  constexpr std::uint32_t kSplits = 8;
+  constexpr std::uint32_t kChain = 8;
+  constexpr std::uint32_t kFirst = kTopK - 8;
+  const std::uint32_t n_kv = kFirst + 7 + kChain;
+  const std::uint32_t mask_words = ((n_kv + kRatio - 1) / kRatio + 31) / 32;
+  const std::size_t kv_count = static_cast<std::size_t>(n_kv) * kKvWidth;
+  std::vector<__half> kh(kv_count);
+  std::vector<__half> vh(kv_count);
+  {
+    const auto kf = MakeValues(kv_count, seed ^ 0xAAAAU, 1.0F);
+    const auto vf = MakeValues(kv_count, seed ^ 0x3333U, 1.0F);
+    for (std::size_t i = 0; i < kv_count; ++i) {
+      kh[i] = __float2half(kf[i]);
+      vh[i] = __float2half(vf[i]);
+    }
+  }
+  HipBuffer<__half> d_k(kv_count);
+  HipBuffer<__half> d_v(kv_count);
+  Upload(&d_k, kh);
+  Upload(&d_v, vh);
+  const std::size_t q_count = std::size_t{kChain} * kQWidth;
+  HipBuffer<float> d_q(q_count);
+  HipBuffer<std::uint32_t> d_mask(std::size_t{kChain} * mask_words);
+  HipBuffer<std::uint32_t> d_pos(1);
+  HipBuffer<std::uint32_t> d_lists(std::size_t{kChain} * kBudget);
+  HipBuffer<std::uint32_t> d_counts(kChain);
+  HipBuffer<float> d_partials(std::size_t{kChain} * kHeads * kSplits *
+                              (kDim + 2));
+  HipBuffer<float> d_out(q_count);
+  std::uint32_t state = seed ^ 0x77777777U;
+  std::uint32_t walk_differs = 0;
+  for (std::uint32_t first = kFirst; first < kTopK; ++first) {
+    const auto qv = MakeValues(q_count, seed + first, 4.0F);
+    // The selector's mask: every word of a row within the budget, else a
+    // random full budget of complete blocks.
+    std::vector<std::uint32_t> mask(std::size_t{kChain} * mask_words);
+    for (std::uint32_t t = 0; t < kChain; ++t) {
+      const std::uint32_t complete = (first + t + 1) / kRatio;
+      std::uint32_t* row = mask.data() + std::size_t{t} * mask_words;
+      if (complete <= kBudget) {
+        std::fill(row, row + mask_words, 0xFFFFFFFFU);
+        continue;
+      }
+      for (std::uint32_t selected = 0; selected < kBudget;) {
+        const auto block = NextRandom(&state) % complete;
+        if ((row[block / 32] & (1U << (block % 32))) == 0) {
+          row[block / 32] |= 1U << (block % 32);
+          ++selected;
+        }
+      }
+    }
+    Upload(&d_q, qv);
+    Upload(&d_mask, mask);
+    const auto launch = [&](std::uint32_t row, std::uint32_t rows, bool masked,
+                            std::uint32_t dense_extent) {
+      Upload(&d_pos, std::vector<std::uint32_t>{first + row});
+      q::Attention(
+          d_q.get() + std::size_t{row} * kQWidth, d_k.get(), d_v.get(),
+          masked ? d_mask.get() + std::size_t{row} * mask_words : nullptr,
+          mask_words, d_out.get() + std::size_t{row} * kQWidth,
+          d_partials.get(), kSplits, rows, d_pos.get(), kHeads, kKvHeads, kDim,
+          kRatio, nullptr, d_lists.get(), d_counts.get(), kBudget,
+          dense_extent);
+      CheckHip(hipDeviceSynchronize(), "budget attention");
+    };
+    for (std::uint32_t t = 0; t < kChain; ++t)
+      launch(t, 1, first + t >= kTopK, kTopK);
+    const auto alone = Download(&d_out, q_count);
+    launch(0, kChain, true, kTopK);
+    const auto chained = Download(&d_out, q_count);
+    launch(0, kChain, true, 0);
+    const auto walk = Download(&d_out, q_count);
+    for (std::uint32_t t = 0; t < kChain; ++t) {
+      const auto at = std::size_t{t} * kQWidth;
+      if (std::memcmp(alone.data() + at, chained.data() + at,
+                      kQWidth * sizeof(float)) != 0)
+        throw std::runtime_error(
+            "attention row " + std::to_string(first + t) +
+            " differs between a budget-crossing chain and decoding alone");
+      walk_differs += std::memcmp(alone.data() + at, walk.data() + at,
+                                  kQWidth * sizeof(float)) != 0;
+    }
+  }
+  // Rows with an incomplete tail block before the budget take another tile
+  // partition on the mask walk; the check must be able to see that.
+  if (walk_differs == 0)
+    throw std::runtime_error("the budget check cannot tell the routes apart");
+  std::cout << "budget-crossing chains from " << kFirst << " to " << kTopK - 1
+            << ": rows bitwise-equal to decoding alone (" << walk_differs
+            << " rows differ on the mask walk)\n";
+}
+
 void CheckChunks(std::uint32_t n, std::uint32_t split) {
   const std::size_t count = std::size_t(n) * kQWidth;
   HipBuffer<float> queries(count), gates(count), full(count), chunked(count);
@@ -858,19 +1111,25 @@ void CheckWmmaLiveExtent() {
   HipBuffer<float> qv(kQWidth), gate(kQWidth), out(kQWidth);
   HipBuffer<__half> k(kKvWidth), v(kKvWidth);
   HipBuffer<std::uint32_t> mask(3200);
+  // Both cases are refused before any launch, so the small buffers are safe.
   const auto accepts = [&](std::uint32_t n, std::uint32_t start,
                            std::uint32_t words) {
     return q::WmmaCausalAttention(qv.get(), gate.get(), k.get(), v.get(),
                                   mask.get(), words, out.get(), n, start,
                                   kHeads, kKvHeads, kDim, kRatio, nullptr);
   };
-  // 262,141 + 4 visible tokens need 65,537 blocks = 2,049 words.
-  if (accepts(4, 262141, 3200))
-    throw std::runtime_error("WMMA accepted a live extent past 2048 words");
   // A row stride narrower than the live extent is a caller error.
   if (accepts(4, 131069, 1024))
     throw std::runtime_error("WMMA accepted a stride below the live extent");
-  std::cout << "WMMA live extent: rejects past 262,144 visible tokens\n";
+  // Compact entries hold 28-bit block indices: 2^30 visible tokens at most.
+  const std::uint32_t limit =
+      q::WmmaCausalAttentionContextLimit(kHeads, kKvHeads, kDim, kRatio);
+  if (limit != (1U << 30))
+    throw std::runtime_error("WMMA context limit is not 2^30 tokens");
+  if (accepts(4, limit - 3, (1U << 23) + 1))
+    throw std::runtime_error("WMMA accepted an extent past 2^28 blocks");
+  std::cout << "WMMA live extent: limit " << limit
+            << " tokens, narrow stride refused\n";
 }
 
 }  // namespace
@@ -879,7 +1138,9 @@ int main() {
   try {
     CheckChunks(136, 94);
     CheckChunks(2048, 1025);
+    CheckBudgetRows(0xB0D6E7U);
     CheckWmmaLiveExtent();
+    CheckPositionPastMask();
     CheckPreparation(1, 0, 64);
     CheckPreparation(8, 4096, 64);
     CheckPreparation(65, 131069, 64);
@@ -891,6 +1152,12 @@ int main() {
       for (const std::uint32_t position : {1000U, 300000U, 650000U})
         CheckYarnPhase(factor, position);
     CheckYarnVisionPhase(2.5F);
+    CheckRerotation({1.0F, 2.0F}, 300000);
+    CheckRerotation({2.0F, 4.0F}, 300000);
+    CheckRerotation({2.0F, 1.0F}, 300000);
+    CheckRerotation({1.0F, 2.0F, 3.0F, 3.875F}, 300000);
+    CheckRerotation({1.5625F, 1.0F}, 300000, 262144);
+    CheckRerotation({1.0F, 1.5625F, 1.0F, 1.5625F}, 300000);
     CheckOracleRms();
     // Structured selections against the sparse path's 1024-block compaction
     // windows and 64-block key tiles. At 131069 the last 512 blocks sit in
@@ -1006,13 +1273,27 @@ int main() {
       // values of order one.
       ok = ok && worst < 2e-2;
     }
-    // A capacity wider than 262,144 (3,200 words at 409,600) keeps chunks
-    // whose visible extent fits 2,048 words on the fused kernel.
-    for (const auto& [n, start] :
-         {std::pair{5U, 131069U}, std::pair{4U, 262140U}}) {
-      const double worst = Compare(n, start, true, seed++, true, true, 3200);
-      std::cout << "WMMA attention n=" << n << " start=" << start
-                << " stride=3200 worst absolute error " << worst << '\n';
+    // A capacity wider than 262,144 (3,200 words at 409,600). Up to 2,048
+    // live words the union mask is built in one pass; past it (2,049 words
+    // at 262,141 + 4, then up to 3,200 at 409,600) in several. Budgeted rows
+    // compact their union; one-in-sixteen random rows overflow the list and
+    // walk the union words, in LDS up to 2,052 words and recomputed from
+    // the rows' masks beyond.
+    struct Wide {
+      std::uint32_t n_tokens;
+      std::uint32_t start_pos;
+      bool bounded;
+    };
+    for (const Wide& c :
+         {Wide{5, 131069, true}, Wide{4, 262140, true}, Wide{4, 262141, true},
+          Wide{4, 262141, false}, Wide{7, 262141, true}, Wide{4, 397688, true},
+          Wide{7, 397688, true}, Wide{5, 409595, true},
+          Wide{5, 409595, false}}) {
+      const double worst =
+          Compare(c.n_tokens, c.start_pos, true, seed++, true, c.bounded, 3200);
+      std::cout << "WMMA attention n=" << c.n_tokens << " start=" << c.start_pos
+                << " stride=3200 " << (c.bounded ? "budgeted" : "sparse")
+                << " worst absolute error " << worst << '\n';
       ok = ok && worst < 2e-2;
     }
     return ok ? 0 : 1;

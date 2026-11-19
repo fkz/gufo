@@ -1,13 +1,12 @@
-#include "src/models/embedding_gemma2/config.hpp"
+#include "config.hpp"
 
 #include <charconv>
 #include <filesystem>
 #include <fstream>
+#include <gufo/ext/json.hpp>
 #include <sstream>
 #include <string>
 #include <string_view>
-
-#include "src/core/json.hpp"
 
 namespace gufo::models::embedding_gemma2 {
 namespace {
@@ -180,6 +179,8 @@ std::optional<ModelConfig> ParseModelConfig(const std::string& json_contents) {
         root.member_size("image_token_id") == 258880 &&
         root.member_size("eoi_token_id") == 258882;
   }
+  config.supported_video = config.supported_vision &&
+                           root.member_size("video_token_id") == kVideoTokenId;
   if (const auto* audio = root.find("audio_config");
       audio && audio->is_object()) {
     const auto* channels = audio->find("subsampling_conv_channels");

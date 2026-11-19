@@ -1,10 +1,11 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
 #include <chrono>
+#include <functional>
+#include <gufo/ext/experimental/hip_utils.hpp>
 #include <stdexcept>
 #include <thread>
 
-#include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 
 namespace gufo::hip {
@@ -13,7 +14,41 @@ void QwenGpuExecutor::CheckPrefillCancellation() const {
     throw QwenPrefillCancelled();
 }
 
+void QwenGpuExecutor::SetPrefillYield(std::size_t groups,
+                                      std::function<void()> yield) {
+  std::vector<std::uint32_t> layers;
+  const std::uint32_t count = weights_.config.num_layers;
+  for (std::size_t k = 1; k < groups; ++k) {
+    const auto layer = static_cast<std::uint32_t>(k * count / groups);
+    if (layer != 0 && layer < count &&
+        (layers.empty() || layers.back() != layer))
+      layers.push_back(layer);
+  }
+  SetPrefillYieldLayers(std::move(layers), std::move(yield));
+}
+
+void QwenGpuExecutor::SetPrefillYieldLayers(std::vector<std::uint32_t> layers,
+                                            std::function<void()> yield) {
+  yield_layers_.clear();
+  yield_ = {};
+  if (layers.empty() || !yield)
+    return;
+  if (std::ranges::adjacent_find(layers, std::ranges::greater_equal{}) !=
+          layers.end() ||
+      layers.back() >= weights_.config.num_layers)
+    throw std::invalid_argument("prefill yield layers must ascend in range");
+  yield_layers_ = std::move(layers);
+  yield_ = std::move(yield);
+}
+
 void QwenGpuExecutor::PrefillLayerCheckpoint(std::uint32_t layer) {
+  // Every buffer this pass carries across layers is in this executor's
+  // arena, which no other session's decode touches. Draining the queued
+  // layers first keeps them from sharing the GPU with the decode round.
+  if (yield_ && std::ranges::binary_search(yield_layers_, layer)) {
+    HIP_CHECK(hipStreamSynchronize(arena_.stream));
+    yield_();
+  }
   CheckPrefillCancellation();
   // Keep one four-layer group ahead of the GPU. Without backpressure, AR
   // can enqueue the whole prompt before the client disconnects; checking

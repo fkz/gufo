@@ -12,9 +12,9 @@
 #include <hip/hip_runtime.h>
 
 #include "src/core/hip/hip_utils.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen/hip/ops.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
 #include "tests/models/qwen/hip/support/device_buffer.hpp"
 #include "tests/models/qwen/support/synthetic_weights.hpp"
@@ -195,6 +195,10 @@ void TestCanonicalMemoryAccountingAndSnapshot() {
     source[i] = static_cast<float>(i + 1);
   HIP_CHECK(hipMemcpy(fp32_arena.d_kv_cache, source.data(),
                       source.size() * sizeof(float), hipMemcpyHostToDevice));
+  // SaveSnapshot reads on the arena's nonblocking stream, which does not
+  // order with this default-stream upload; finish the upload first, the
+  // edge the restore window below documents.
+  HIP_CHECK(hipDeviceSynchronize());
   auto saved = fp32_arena.SaveSnapshot(7);
   std::vector<std::uint8_t> serialized(saved->CompactPayloadBytes(), 0xA5);
   saved->SerializeCompact(serialized);

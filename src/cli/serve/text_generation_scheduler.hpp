@@ -12,6 +12,7 @@
 
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/sched/policy.hpp"
 
 namespace gufo::server {
 
@@ -24,17 +25,12 @@ enum class TextRequestPhase : std::uint8_t {
   kTerminal,
 };
 
-inline constexpr std::size_t kDefaultDecodeActivePrefillTokens = 512;
 inline constexpr std::size_t kDefaultMaxOutputBytes =
     static_cast<std::size_t>(1024) * 1024;
 inline constexpr std::size_t kDefaultMaxBufferedOutputBytes =
     static_cast<std::size_t>(64) * 1024;
 inline constexpr std::size_t kDefaultMaxBufferedOutputBytesTotal =
     static_cast<std::size_t>(256) * 1024;
-
-struct TextPrefillPolicy {
-  std::size_t decode_active_tokens{kDefaultDecodeActivePrefillTokens};
-};
 
 struct TextSchedulerPolicy {
   /// Internal cadence; idle monitoring performs no work during inference.
@@ -55,6 +51,13 @@ struct TextSchedulerPolicy {
   /// disables it.
   std::chrono::milliseconds stall_timeout{0};
   bool log_progress{false};
+  /// Internal prompt granularity of the scheduling policy
+  /// (sched::kPrefillUnitTokens); tests shrink it to keep prompts small.
+  std::size_t prefill_unit_tokens{sched::kPrefillUnitTokens};
+  /// How often an idle scheduler lets the pool return memory only running
+  /// work holds (TextRunnerPool::Idle): a /proc/meminfo read when nothing is
+  /// held.
+  std::chrono::milliseconds idle_interval{std::chrono::seconds(1)};
 };
 
 /// Single-owner scheduler for opaque text-model runner states.
@@ -77,10 +80,15 @@ public:
     Clock::time_point request_start{Clock::now()};
     std::shared_ptr<const TextPromptContext> prompt_context;
     bool cache_prompt{true};
+    /// False keeps this request's checkpoints out of the disk cache.
+    bool cache_persist{true};
     std::size_t cache_prefix_tokens{0};
     bool stop_at_eos{true};
     std::vector<std::string> stop_sequences;
     bool return_progress{false};
+    /// A chat template rendered the prompt, trimming whitespace from the
+    /// edges of message content.
+    bool chat_template{false};
   };
 
   class Request {
@@ -109,6 +117,10 @@ public:
 
   private:
     friend class TextGenerationScheduler;
+#ifdef GUFO_CACHE_TESTING
+    // The fixture pauses the scheduler before observing its capture future.
+    friend bool SnapshotPendingForTesting(const Request& request);
+#endif
     struct Impl;
 
     explicit Request(std::unique_ptr<Impl> impl);
@@ -116,7 +128,6 @@ public:
   };
 
   explicit TextGenerationScheduler(std::shared_ptr<TextRunnerPool> runner_pool,
-                                   TextPrefillPolicy prefill_policy = {},
                                    TextSchedulerPolicy scheduler_policy = {});
   ~TextGenerationScheduler();
 
@@ -134,6 +145,18 @@ public:
   [[nodiscard]] std::vector<SessionState> SessionStates() const;
   [[nodiscard]] std::size_t buffered_output_bytes() const noexcept;
   [[nodiscard]] std::size_t max_buffered_output_bytes() const noexcept;
+
+  struct PromptAdmissionBudget {
+    std::size_t budget_bytes{0};
+    std::size_t used_bytes{0};
+    std::size_t available_bytes{0};
+  };
+  /// Null when the runner does not publish prompt-state admission inputs.
+  [[nodiscard]] std::optional<PromptAdmissionBudget>
+  PromptAdmissionBudgetSnapshot() const;
+  /// Null unless sessions share their demand-mapped state (#715).
+  [[nodiscard]] std::optional<TextGenerationBackend::SharedState>
+  SharedStateSnapshot() const;
 
   [[nodiscard]] Request Submit(std::vector<TextRunnerToken> prompt,
                                std::size_t max_tokens,

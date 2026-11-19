@@ -8,6 +8,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -15,14 +16,49 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/multipart.hpp"
+#include "src/core/image.hpp"
 #include "src/core/json.hpp"
+#include "src/ext/video.hpp"
 
 namespace gufo::server {
 namespace {
 
+std::optional<int> ResolveDurationFrames(std::string_view seconds,
+                                         std::string* error = nullptr) {
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->resolve_duration_frames) {
+    return provider->resolve_duration_frames(seconds, error);
+  }
+  if (error)
+    *error = "video provider 'minimax-h3' not available";
+  return std::nullopt;
+}
+
+std::optional<ext::VideoParameters> ResolveGenerationPreset(
+    std::string_view preset, std::string* error = nullptr) {
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->resolve_preset) {
+    return provider->resolve_preset(preset, error);
+  }
+  if (error)
+    *error = "video provider 'minimax-h3' not available";
+  return std::nullopt;
+}
+
+bool ValidateGenerationParameters(const ext::VideoParameters& parameters,
+                                  std::string* error = nullptr) {
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->validate_parameters) {
+    return provider->validate_parameters(parameters, error);
+  }
+  if (error)
+    *error = "video provider 'minimax-h3' not available";
+  return false;
+}
+
 constexpr std::string_view kVideosPath = "/v1/videos";
 constexpr double kMaximumExactJsonInteger = 9007199254740991.0;
-constexpr std::size_t kMaximumMultipartHeadersBytes = 16U << 10U;
 constexpr std::size_t kMaximumMultipartFields = 16;
 
 HttpResponse Error(int status, std::string reason, std::string message,
@@ -121,232 +157,67 @@ bool EqualCaseInsensitive(std::string_view left, std::string_view right) {
   return true;
 }
 
-std::vector<std::string_view> HeaderSegments(std::string_view value,
-                                             bool* valid) {
-  std::vector<std::string_view> result;
-  std::size_t begin = 0;
-  bool quoted = false;
-  bool escaped = false;
-  for (std::size_t index = 0; index < value.size(); ++index) {
-    const char character = value[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (quoted && character == '\\') {
-      escaped = true;
-      continue;
-    }
-    if (character == '"') {
-      quoted = !quoted;
-    } else if (character == ';' && !quoted) {
-      result.push_back(TrimAscii(value.substr(begin, index - begin)));
-      begin = index + 1;
-    }
-  }
-  if (quoted || escaped) {
-    *valid = false;
-    return {};
-  }
-  result.push_back(TrimAscii(value.substr(begin)));
-  *valid = true;
-  return result;
-}
-
-bool DecodeHeaderParameter(std::string_view value, std::string* output) {
-  value = TrimAscii(value);
-  if (value.empty()) {
-    output->clear();
-    return true;
-  }
-  if (value.front() != '"') {
-    if (value.find_first_of("\"\r\n") != std::string_view::npos) {
-      return false;
-    }
-    *output = value;
-    return true;
-  }
-  if (value.size() < 2 || value.back() != '"') {
-    return false;
-  }
-  output->clear();
-  const std::string_view inner = value.substr(1, value.size() - 2);
-  bool escaped = false;
-  for (const char character : inner) {
-    if (escaped) {
-      output->push_back(character);
-      escaped = false;
-    } else if (character == '\\') {
-      escaped = true;
-    } else if (character == '"' || character == '\r' || character == '\n') {
-      return false;
-    } else {
-      output->push_back(character);
-    }
-  }
-  return !escaped;
-}
-
-bool HeaderParameter(std::string_view value, std::string_view parameter,
-                     std::string* output, bool* present) {
-  bool valid = false;
-  const std::vector<std::string_view> segments = HeaderSegments(value, &valid);
-  if (!valid || segments.empty()) {
-    return false;
-  }
-  *present = false;
-  for (std::size_t index = 1; index < segments.size(); ++index) {
-    const std::size_t equals = segments[index].find('=');
-    if (equals == std::string_view::npos) {
-      return false;
-    }
-    const std::string_view name = TrimAscii(segments[index].substr(0, equals));
-    if (!EqualCaseInsensitive(name, parameter)) {
-      continue;
-    }
-    if (*present ||
-        !DecodeHeaderParameter(segments[index].substr(equals + 1), output)) {
-      return false;
-    }
-    *present = true;
-  }
-  return true;
-}
-
-bool IsMultipartFormData(std::string_view content_type) {
-  const std::size_t semicolon = content_type.find(';');
-  return EqualCaseInsensitive(TrimAscii(content_type.substr(0, semicolon)),
-                              "multipart/form-data");
-}
-
-std::optional<std::string> MultipartBoundary(std::string_view content_type) {
-  std::string boundary;
-  bool present = false;
-  if (!HeaderParameter(content_type, "boundary", &boundary, &present) ||
-      !present || boundary.empty() || boundary.size() > 200 ||
-      boundary.find_first_of("\r\n") != std::string::npos) {
-    return std::nullopt;
-  }
-  return boundary;
-}
-
-std::optional<json::Value> ParseMultipartBody(const HttpRequest& request,
-                                              std::string* error) {
-  const auto boundary = MultipartBoundary(request.header("content-type"));
-  if (!boundary.has_value()) {
-    *error = "multipart video request has an invalid boundary";
-    return std::nullopt;
-  }
-  const std::string delimiter = "--" + *boundary;
-  const std::string_view body = request.body;
-  if (!body.starts_with(delimiter)) {
-    *error = "multipart video request does not start with its boundary";
-    return std::nullopt;
-  }
-
+// The form's fields as a JSON object; nullopt with *error when it is
+// malformed, or with *form_data false when the body is not a form.
+std::optional<json::Value> ParseMultipartBody(
+    const HttpRequest& request,
+    std::map<std::string, std::string>* binary_fields, std::string* error,
+    bool* form_data) {
+  *form_data = true;
   json::Value result = json::Value::object();
-  std::size_t cursor = delimiter.size();
-  std::size_t fields = 0;
-  while (true) {
-    if (body.substr(cursor).starts_with("--")) {
-      cursor += 2;
-      if (body.substr(cursor).starts_with("\r\n")) {
-        cursor += 2;
-      }
-      if (cursor != body.size()) {
-        *error = "multipart video request has data after its final boundary";
-        return std::nullopt;
-      }
+  MultipartResult form = ParseMultipart(
+      request.header("content-type"), request.body,
+      {.max_fields = kMaximumMultipartFields, .unique_names = true},
+      [&](const MultipartField& field) {
+        const std::string field_name(field.name);
+        const std::string_view content = field.content;
+        if (field_name == "gufo" && !field.has_filename) {
+          try {
+            json::Value extension = json::parse(std::string(content));
+            if (!extension.is_object()) {
+              *error = "multipart 'gufo' field must contain a JSON object";
+              return false;
+            }
+            result[field_name] = std::move(extension);
+          } catch (const std::exception&) {
+            *error = "multipart 'gufo' field must contain valid JSON";
+            return false;
+          }
+        } else if (field.has_filename && binary_fields != nullptr &&
+                   (field_name == "first_frame" ||
+                    field_name == "last_frame")) {
+          // Keyframe anchors keep their raw bytes out of the JSON value; the
+          // empty sentinel only marks presence for CreateVideo.
+          (*binary_fields)[field_name] = std::string(content);
+          result[field_name] = std::string();
+        } else {
+          result[field_name] =
+              field.has_filename ? std::string() : std::string(content);
+        }
+        return true;
+      });
+  switch (form.status) {
+    case MultipartStatus::kComplete:
       return result;
-    }
-    if (!body.substr(cursor).starts_with("\r\n")) {
-      *error = "multipart video request has an invalid boundary separator";
-      return std::nullopt;
-    }
-    cursor += 2;
-    const std::size_t headers_end = body.find("\r\n\r\n", cursor);
-    if (headers_end == std::string_view::npos ||
-        headers_end - cursor > kMaximumMultipartHeadersBytes) {
-      *error = "multipart video request has invalid part headers";
-      return std::nullopt;
-    }
-
-    std::string content_disposition;
-    std::string_view headers = body.substr(cursor, headers_end - cursor);
-    while (!headers.empty()) {
-      const std::size_t newline = headers.find("\r\n");
-      const std::string_view line = headers.substr(0, newline);
-      const std::size_t colon = line.find(':');
-      if (colon == std::string_view::npos) {
-        *error = "multipart video request has a malformed part header";
-        return std::nullopt;
-      }
-      const std::string_view name = TrimAscii(line.substr(0, colon));
-      const std::string_view value = TrimAscii(line.substr(colon + 1));
-      if (EqualCaseInsensitive(name, "content-disposition")) {
-        if (!content_disposition.empty()) {
-          *error = "multipart video request repeats Content-Disposition";
-          return std::nullopt;
-        }
-        content_disposition = value;
-      }
-      if (newline == std::string_view::npos) {
-        break;
-      }
-      headers.remove_prefix(newline + 2);
-    }
-
-    bool disposition_valid = false;
-    const std::vector<std::string_view> disposition_segments =
-        HeaderSegments(content_disposition, &disposition_valid);
-    std::string field_name;
-    std::string filename;
-    bool name_present = false;
-    bool filename_present = false;
-    if (!disposition_valid || disposition_segments.empty() ||
-        !EqualCaseInsensitive(disposition_segments.front(), "form-data") ||
-        !HeaderParameter(content_disposition, "name", &field_name,
-                         &name_present) ||
-        !HeaderParameter(content_disposition, "filename", &filename,
-                         &filename_present) ||
-        !name_present || field_name.empty()) {
-      *error = "multipart video request has invalid Content-Disposition";
-      return std::nullopt;
-    }
-
-    const std::size_t content_begin = headers_end + 4;
-    const std::string next_boundary = "\r\n" + delimiter;
-    const std::size_t content_end = body.find(next_boundary, content_begin);
-    if (content_end == std::string_view::npos) {
-      *error = "multipart video request is missing a closing boundary";
-      return std::nullopt;
-    }
-    if (++fields > kMaximumMultipartFields || result.contains(field_name)) {
-      *error = fields > kMaximumMultipartFields
-                   ? "multipart video request contains too many fields"
-                   : "multipart video request repeats a field";
-      return std::nullopt;
-    }
-    const std::string_view content =
-        body.substr(content_begin, content_end - content_begin);
-    if (field_name == "gufo" && !filename_present) {
-      try {
-        json::Value extension = json::parse(std::string(content));
-        if (!extension.is_object()) {
-          *error = "multipart 'gufo' field must contain a JSON object";
-          return std::nullopt;
-        }
-        result[field_name] = std::move(extension);
-      } catch (const std::exception&) {
-        *error = "multipart 'gufo' field must contain valid JSON";
-        return std::nullopt;
-      }
-    } else {
-      result[field_name] =
-          filename_present ? std::string() : std::string(content);
-    }
-    cursor = content_end + next_boundary.size();
+    case MultipartStatus::kStopped:
+      break;
+    case MultipartStatus::kNotFormData:
+      *form_data = false;
+      break;
+    case MultipartStatus::kBadBoundary:
+      *error = "multipart video request has an invalid boundary";
+      break;
+    case MultipartStatus::kTooManyFields:
+      *error = "multipart video request contains too many fields";
+      break;
+    case MultipartStatus::kDuplicateField:
+      *error = "multipart video request repeats a field";
+      break;
+    case MultipartStatus::kMalformed:
+      *error = std::move(form.detail);
+      break;
   }
+  return std::nullopt;
 }
 
 std::optional<std::uint64_t> JsonUnsigned(const json::Value* value) {
@@ -371,8 +242,8 @@ std::optional<int> JsonFrame(const json::Value* value) {
 }
 
 bool IsUnsupportedConditioning(const json::Value& body) {
-  static constexpr std::string_view kUnsupported[] = {
-      "input_reference", "first_frame", "last_frame", "references"};
+  static constexpr std::string_view kUnsupported[] = {"input_reference",
+                                                      "references"};
   return std::ranges::any_of(kUnsupported, [&](std::string_view key) {
     return body.contains(std::string(key));
   });
@@ -380,10 +251,13 @@ bool IsUnsupportedConditioning(const json::Value& body) {
 
 HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   json::Value body;
+  std::map<std::string, std::string> binary_fields;
   const std::string content_type = request.header("content-type");
-  if (IsMultipartFormData(content_type)) {
-    std::string multipart_error;
-    auto parsed = ParseMultipartBody(request, &multipart_error);
+  std::string multipart_error;
+  bool form_data = false;
+  auto parsed =
+      ParseMultipartBody(request, &binary_fields, &multipart_error, &form_data);
+  if (form_data) {
     if (!parsed.has_value()) {
       return Error(400, "Bad Request", std::move(multipart_error),
                    "invalid_multipart_form");
@@ -410,15 +284,12 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     return Error(400, "Bad Request", "request body must be a JSON object",
                  "invalid_body");
   }
+  // Unknown members are ignored, as in the other OpenAI-compatible servers;
+  // known conditioning fields are refused rather than silently dropped.
   if (IsUnsupportedConditioning(body)) {
     return Error(400, "Bad Request",
-                 "image and ordered-reference conditioning are not supported",
+                 "ordered-reference conditioning is not supported",
                  "unsupported_input_reference");
-  }
-  if (!HasOnlyMembers(body, {"model", "prompt", "size", "seconds", "gufo"})) {
-    return Error(400, "Bad Request",
-                 "request contains an unsupported video field",
-                 "unsupported_field");
   }
 
   const json::Value* model_value = body.find("model");
@@ -431,7 +302,9 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                  "'model', 'prompt', and optional 'size' must be strings",
                  "invalid_parameter_type");
   }
-  const std::string model = model_value->str();
+  // Alias names behave as the root model; preset-selecting variant names
+  // stay canonical (#957).
+  const std::string model = service.normalize_model(model_value->str());
   const std::string prompt = prompt_value->str();
   const std::string size = body.member_str("size", "512x512");
   const json::Value* seconds_value = body.find("seconds");
@@ -447,8 +320,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                  "missing_required_parameter");
   }
   std::string duration_error;
-  const auto duration_frames =
-      minimax_h3::ResolveDurationFrames(seconds, &duration_error);
+  const auto duration_frames = ResolveDurationFrames(seconds, &duration_error);
   if (!duration_frames) {
     return Error(400, "Bad Request", duration_error, "invalid_seconds");
   }
@@ -531,7 +403,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   }
 
   std::string preset_error;
-  auto parameters = minimax_h3::ResolveGenerationPreset(preset, &preset_error);
+  auto parameters = ResolveGenerationPreset(preset, &preset_error);
   if (!parameters.has_value()) {
     return Error(400, "Bad Request", preset_error, "invalid_preset");
   }
@@ -557,14 +429,75 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                  "invalid_output_format");
   }
   std::string parameter_error;
-  if (!minimax_h3::ValidateGenerationParameters(*parameters,
-                                                &parameter_error)) {
+  if (!ValidateGenerationParameters(*parameters, &parameter_error)) {
     return Error(400, "Bad Request", parameter_error, "invalid_frames");
   }
   if (parameters->frames != *duration_frames) {
     return Error(400, "Bad Request",
                  "'gufo.frames' must match the aligned 'seconds' duration",
                  "invalid_frames");
+  }
+
+  // Keyframe anchors (issue #177): multipart file parts or base64 data URLs,
+  // validated to decodable PNG/JPEG/WebP (display orientation applied by
+  // the shared decoder) before admission; raw bytes are staged into the
+  // job directory by the service.
+  std::vector<std::uint8_t> first_frame;
+  std::vector<std::uint8_t> last_frame;
+  const auto load_keyframe = [&](std::string_view field,
+                                 std::vector<std::uint8_t>* out) {
+    const json::Value* value = body.find(std::string(field));
+    if (value == nullptr) {
+      return std::optional<std::string>{};
+    }
+    const auto uploaded = binary_fields.find(std::string(field));
+    if (uploaded != binary_fields.end()) {
+      out->assign(uploaded->second.begin(), uploaded->second.end());
+    } else if (value->is_string() && value->str().starts_with("data:")) {
+      // Only inline data URLs: the video endpoint never fetches remote
+      // imagery on the client's behalf.
+      try {
+        core::ImageReadBudget budget;
+        const std::vector<std::uint8_t> bytes =
+            core::ReadImageUrl(value->str(), budget);
+        out->assign(bytes.begin(), bytes.end());
+      } catch (const std::exception&) {
+        out->clear();
+        return std::optional<std::string>{
+            "'" + std::string(field) +
+            "' could not be read; provide an image data URL or file upload"};
+      }
+    } else {
+      return std::optional<std::string>{
+          "'" + std::string(field) +
+          "' must be a base64 image data URL or file upload"};
+    }
+    if (out->empty() || out->size() > core::kMaxEncodedImageBytes) {
+      return std::optional<std::string>{
+          "'" + std::string(field) +
+          "' is empty or exceeds the encoded image limit"};
+    }
+    try {
+      const core::Image decoded =
+          core::DecodeImage(std::span<const std::uint8_t>(*out));
+      if (decoded.width == 0 || decoded.height == 0) {
+        throw std::invalid_argument("empty decode");
+      }
+    } catch (const std::exception&) {
+      return std::optional<std::string>{
+          "'" + std::string(field) +
+          "' is not a decodable PNG, JPEG, or WebP image"};
+    }
+    return std::optional<std::string>{};
+  };
+  const std::optional<std::string> first_error =
+      load_keyframe("first_frame", &first_frame);
+  const std::optional<std::string> last_error =
+      load_keyframe("last_frame", &last_frame);
+  if (first_error.has_value() || last_error.has_value()) {
+    return Error(400, "Bad Request",
+                 first_error.has_value() ? *first_error : *last_error,
+                 "invalid_frame_image");
   }
 
   const VideoJobCreateResult created = service.Create({
@@ -575,6 +508,8 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
       .output_format = output_format,
       .parameters = std::move(*parameters),
       .seed = seed,
+      .first_frame_bytes = std::move(first_frame),
+      .last_frame_bytes = std::move(last_frame),
   });
   if (created.result == VideoJobResult::kQueueFull) {
     HttpResponse response =

@@ -1,16 +1,15 @@
-#include "src/core/image.hpp"
-
 #include <png.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <gufo/ext/image.hpp>
+#include <gufo/ext/sha256.hpp>
 #include <limits>
 #include <numbers>
 #include <stdexcept>
 
-#include "src/core/crypto/sha256.hpp"
 #include "src/models/qwen_image_21/model.hpp"
 
 namespace gufo::models::qwen_image_21 {
@@ -73,14 +72,9 @@ std::vector<Filter> LanczosFilters(int input, int output) {
   return result;
 }
 
-}  // namespace
-
-std::uint64_t InitialNoiseSeed(std::uint64_t seed,
-                               std::span<const Image> images) {
-  if (images.empty())
-    return seed;
+std::uint64_t HashSeed(std::span<const std::uint8_t> domain, std::uint64_t seed,
+                       std::span<const Image> images) {
   crypto::Sha256Hasher hash;
-  constexpr std::uint8_t domain[] = "Qwen-Image-2.1 edit noise v1";
   hash.Update(domain);
   const auto append = [&](std::uint64_t value) {
     std::array<std::uint8_t, 8> bytes{};
@@ -101,6 +95,22 @@ std::uint64_t InitialNoiseSeed(std::uint64_t seed,
   for (int i = 0; i < 8; ++i)
     result |= static_cast<std::uint64_t>(digest[i]) << (8 * i);
   return result;
+}
+
+}  // namespace
+
+std::uint64_t InitialNoiseSeed(std::uint64_t seed,
+                               std::span<const Image> images,
+                               const Image* init_image) {
+  if (init_image) {
+    constexpr std::uint8_t domain[] = "Qwen-Image-2.1 img2img noise v1";
+    return HashSeed(domain, InitialNoiseSeed(seed, images),
+                    std::span(init_image, 1));
+  }
+  if (images.empty())
+    return seed;
+  constexpr std::uint8_t domain[] = "Qwen-Image-2.1 edit noise v1";
+  return HashSeed(domain, seed, images);
 }
 
 Image DecodeImage(std::span<const std::uint8_t> bytes) {
@@ -246,7 +256,7 @@ void ValidateRequest(const Request& request) {
     throw std::invalid_argument(
         "image size must be multiples of 32, at most 4096 per side and 4 "
         "megapixels");
-  if (request.steps < 2 || request.steps > 100)
+  if (request.steps != 0 && (request.steps < 2 || request.steps > 100))
     throw std::invalid_argument("image steps must be between 2 and 100");
   if (request.images.size() > 10)
     throw std::invalid_argument(
@@ -259,11 +269,49 @@ void ValidateRequest(const Request& request) {
   if (pixels > core::kMaxImagePixels)
     throw std::invalid_argument(
         "reference images exceed 32 megapixels combined");
+  if (request.loras.size() > 16)
+    throw std::invalid_argument("image requests apply at most 16 LoRAs");
+  for (std::size_t i = 0; i < request.loras.size(); ++i) {
+    const auto& lora = request.loras[i];
+    if (lora.name.empty())
+      throw std::invalid_argument("LoRA name must not be empty");
+    for (std::size_t j = 0; j < i; ++j)
+      if (request.loras[j].name == lora.name)
+        throw std::invalid_argument("duplicate LoRA " + lora.name);
+    if (!std::isfinite(lora.scale) || std::abs(lora.scale) > 10)
+      throw std::invalid_argument(
+          "LoRA scale must be finite and at most 10 in magnitude");
+  }
+  if (request.negative_prompt.size() > (64U << 10U))
+    throw std::invalid_argument("negative prompt exceeds 64 KiB");
+  if (request.guidance_scale &&
+      !(*request.guidance_scale >= 0 && *request.guidance_scale <= 100))
+    throw std::invalid_argument("guidance_scale must be between 0 and 100");
+  if (!(request.strength >= 0.01 && request.strength <= 1))
+    throw std::invalid_argument("strength must be between 0.01 and 1");
+  if (request.strength < 1 && !request.init_image)
+    throw std::invalid_argument("strength below 1 requires an input image");
+  if (request.init_image)
+    CheckImage(*request.init_image);
 }
 
-std::vector<float> FlowSigmas(int steps, int image_tokens) {
-  if (steps < 2 || steps > 100 || image_tokens < 1)
-    throw std::invalid_argument("invalid image flow schedule");
+float ResolveGuidance(const Request& request) {
+  return request.guidance_scale.value_or(1.0F);
+}
+
+std::string ConditionPrompt(std::string_view prompt,
+                            ext::ImageBackground background) {
+  if (background != ext::ImageBackground::kTransparent)
+    return std::string(prompt);
+  // Qwen-Image-2.1 produces RGBA output when the prompt names the alpha
+  // channel; the framing is model-specific, so it lives in this provider.
+  return "This is an RGBA image with transparency. " + std::string(prompt) +
+         " The image has alpha channel and the background is transparent.";
+}
+
+namespace {
+
+std::vector<float> Schedule(int steps, int image_tokens) {
   const double mu = 0.5 + (image_tokens - 256) * (0.9 - 0.5) / (8192 - 256);
   const float shift = static_cast<float>(std::exp(mu));
   std::vector<float> sigmas(steps + 1);
@@ -276,6 +324,51 @@ std::vector<float> FlowSigmas(int steps, int image_tokens) {
     sigmas[i] = 1.0F - (1.0F - sigmas[i]) / scale;
   sigmas[steps] = 0;
   return sigmas;
+}
+
+}  // namespace
+
+std::vector<float> FlowSigmas(int steps, int image_tokens) {
+  if (steps < 2 || steps > 100 || image_tokens < 1)
+    throw std::invalid_argument("invalid image flow schedule");
+  return Schedule(steps, image_tokens);
+}
+
+std::vector<float> StrengthTail(std::vector<float> sigmas, double strength) {
+  if (!(strength > 0 && strength <= 1))
+    throw std::invalid_argument("invalid image denoise strength");
+  // Diffusers img2img get_timesteps: run the last steps * strength steps of
+  // the full schedule (at least one), in the same double arithmetic.
+  const auto steps = static_cast<double>(sigmas.size() - 1);
+  const auto start = static_cast<std::ptrdiff_t>(
+      std::max(steps - std::min(steps * strength, steps), 0.0));
+  sigmas.erase(sigmas.begin(), sigmas.begin() + start);
+  return sigmas;
+}
+
+int SamplingConfig::ResolveSteps(int requested) const {
+  const int steps = requested == 0 ? DefaultSteps() : requested;
+  if (IsTurbo() && steps != 8)
+    throw std::invalid_argument(
+        "Qwen-Image-2.1-Turbo requires its fixed eight-step schedule");
+  if (steps < 2 || steps > 100)
+    throw std::invalid_argument("image steps must be between 2 and 100");
+  return steps;
+}
+
+std::vector<float> SamplingConfig::Sigmas(int requested,
+                                          int image_tokens) const {
+  const int steps = ResolveSteps(requested);
+  if (!IsTurbo())
+    return FlowSigmas(steps, image_tokens);
+  auto result = sample_sigmas;
+  result.push_back(0);
+  return result;
+}
+
+std::vector<float> SamplingConfig::DenoiseSigmas(int requested, double strength,
+                                                 int image_tokens) const {
+  return StrengthTail(Sigmas(requested, image_tokens), strength);
 }
 
 }  // namespace gufo::models::qwen_image_21

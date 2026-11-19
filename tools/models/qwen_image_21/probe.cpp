@@ -2,7 +2,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "src/core/image.hpp"
 #include "src/models/qwen_image_21/model.hpp"
@@ -11,13 +14,15 @@ int main(int argc, char** argv) {
   using namespace gufo::models::qwen_image_21;
   if (argc < 3) {
     std::cerr << "usage: qwen_image_21_probe MODEL_DIR OUTPUT_DIR [PROMPT] "
-                 "[SIZE] [STEPS] [IMAGE|-] [--trajectory] [--seed N]\n";
+                 "[SIZE] [STEPS] [IMAGE|-] [--trajectory] [--seed N] [--width "
+                 "N] [--height N] [--image IMAGE ...] [--lora NAME=PATH]... "
+                 "[--lora-default NAME:SCALE]... [--negative TEXT] "
+                 "[--guidance-scale X] [--init IMAGE --strength S]\n";
     return 2;
   }
   try {
     const auto output = std::filesystem::path(argv[2]);
     std::filesystem::create_directories(output);
-    Model model(argv[1]);
     Request request;
     request.prompt = argc > 3 ? argv[3] : "A red cube on a white table.";
     request.width = request.height = argc > 4 ? std::stoi(argv[4]) : 256;
@@ -26,27 +31,87 @@ int main(int argc, char** argv) {
     if (argc > 6 && std::string_view(argv[6]) != "-")
       request.images.push_back(DecodeImage(gufo::core::ReadImageFile(argv[6])));
     bool trajectory = false;
+    std::vector<std::pair<std::string, std::string>> loras;
+    std::map<std::string, float, std::less<>> scales;
+    const auto split = [](std::string_view value) {
+      const auto equals = value.find('=');
+      if (equals == 0 || equals == std::string_view::npos ||
+          equals + 1 == value.size())
+        throw std::invalid_argument("--lora expects NAME=PATH");
+      return std::pair{std::string(value.substr(0, equals)),
+                       std::string(value.substr(equals + 1))};
+    };
     for (int i = 7; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--trajectory") {
         trajectory = true;
+      } else if ((option == "--width" || option == "--height") &&
+                 i + 1 < argc) {
+        const int value = std::stoi(argv[++i]);
+        (option == "--width" ? request.width : request.height) = value;
+      } else if (option == "--image" && i + 1 < argc) {
+        request.images.push_back(
+            DecodeImage(gufo::core::ReadImageFile(argv[++i])));
+      } else if (option == "--negative" && i + 1 < argc) {
+        request.negative_prompt = argv[++i];
+      } else if (option == "--guidance-scale" && i + 1 < argc) {
+        request.guidance_scale = std::stof(argv[++i]);
+      } else if (option == "--strength" && i + 1 < argc) {
+        request.strength = std::stod(argv[++i]);
+      } else if (option == "--init" && i + 1 < argc) {
+        request.init_image = DecodeImage(gufo::core::ReadImageFile(argv[++i]));
       } else if (option == "--seed" && i + 1 < argc) {
         const std::string_view value(argv[++i]);
         const auto [end, error] = std::from_chars(
             value.data(), value.data() + value.size(), request.seed);
         if (error != std::errc{} || end != value.data() + value.size())
           throw std::invalid_argument("invalid probe seed");
+      } else if (option == "--lora" && i + 1 < argc) {
+        loras.push_back(split(argv[++i]));
+      } else if (option == "--lora-default" && i + 1 < argc) {
+        const std::string_view value(argv[++i]);
+        const auto separator = value.rfind(':');
+        const auto text = value.substr(
+            separator == std::string_view::npos ? value.size() : separator + 1);
+        float scale = 0;
+        const auto [end, error] =
+            std::from_chars(text.data(), text.data() + text.size(), scale);
+        if (separator == std::string_view::npos || separator == 0 ||
+            text.empty() || error != std::errc{} ||
+            end != text.data() + text.size())
+          throw std::invalid_argument("--lora-default expects NAME:SCALE");
+        const std::string name(value.substr(0, separator));
+        if (!scales.emplace(name, scale).second)
+          throw std::invalid_argument("duplicate --lora-default name: " + name);
       } else {
         throw std::invalid_argument("unknown probe option");
       }
     }
+    Model model(argv[1]);
+    for (const auto& [name, path] : loras) {
+      const auto info = model.AddLora(name, path);
+      std::cout << "lora " << name << " format=" << info.format
+                << " targets=" << info.targets << " rank=" << info.min_rank
+                << '-' << info.max_rank << '\n';
+      const auto scale = scales.find(name);
+      request.loras.push_back(
+          {name, scale == scales.end() ? 1.0F : scale->second});
+      if (scale != scales.end())
+        scales.erase(scale);
+    }
+    if (!scales.empty())
+      throw std::invalid_argument("--lora-default names no --lora: " +
+                                  scales.begin()->first);
     std::ofstream ids(output / "tokens.txt");
     for (auto id : model.Tokenize(request.prompt))
       ids << id << '\n';
     Observer observer;
     observer.include = [trajectory](std::string_view name) {
       return !trajectory || name == "noise" || name == "sigmas" ||
-             name == "vae.decoded" || name.starts_with("latent.");
+             name == "vae.decoded" || name.starts_with("latent.") ||
+             name == "init.latent" || name == "init.vae.encoded" ||
+             name.ends_with(".guided") || name == "dit.0.output" ||
+             name == "negative.dit.0.output";
     };
     observer.write = [&](std::string_view name, std::span<const float> values,
                          int rows, int cols) {
@@ -63,7 +128,8 @@ int main(int argc, char** argv) {
     std::cout << "total_ms=" << result.metrics.total_ms
               << " prompt_ms=" << result.metrics.prompt_ms
               << " denoise_ms=" << result.metrics.denoise_ms
-              << " vae_ms=" << result.metrics.vae_ms << '\n';
+              << " vae_ms=" << result.metrics.vae_ms
+              << " lora_ms=" << result.metrics.lora_ms << '\n';
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

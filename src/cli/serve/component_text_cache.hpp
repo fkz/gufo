@@ -1,63 +1,36 @@
 #ifndef GUFO_SERVER_COMPONENT_TEXT_CACHE_HPP_
 #define GUFO_SERVER_COMPONENT_TEXT_CACHE_HPP_
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 
+#include "gufo/ext/text.hpp"
 #include "src/cache/checkpoint.hpp"
+#include "src/cache/component_resources.hpp"
 #include "src/cache/streaming.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
-#include "src/cli/serve/continuation_cache.hpp"
+#include "src/cli/serve/continuation_types.hpp"
 #include "src/cli/serve/text_publication_wait.hpp"
+#include "src/ext/host_budget.hpp"
+#include "src/mem/account.hpp"
 
 namespace gufo::server {
-class TextModelRunner;
-class TextRunnerState;
-class TextRunnerSnapshot;
-struct TextRunnerDiskCacheOptions;
-struct TextPromptContext;
+using ext::TextModelRunner;
+using ext::TextPromptContext;
+using ext::TextRunnerDiskCacheOptions;
+using ext::TextRunnerState;
+
+// The capture/backing contracts are cache-owned (RFC step 6); these aliases
+// keep the serving spelling.
+using cache::ComponentCacheResources;
+using cache::ComponentCaptureBuffer;
 
 // Model-independent serving orchestration; the model supplies physical storage
 // and binds its ordinary execution facade to adapter-owned slots.
-struct ComponentCaptureBuffer {
-  std::span<std::byte> bytes;
-  std::function<cache::Payload()> finish;
-  // Identity of one underlying allocation, for joining adjacent byte spans.
-  // Null providers always transfer each buffer separately.
-  const void* allocation{};
-  // Consume assigned backing without copying completed append rows. The
-  // source view is backend-native and kept immutable by the slot guard.
-  std::function<cache::Payload(cache::SlotLease&, std::span<const std::byte>)>
-      borrow;
-};
-struct ComponentCacheResources {
-  std::shared_ptr<void> owner;
-  std::unique_ptr<cache::Adapter> adapter;
-  cache::StreamLease stream;
-  std::function<ComponentCaptureBuffer(const cache::PayloadRequest&)> allocate;
-  cache::StagingAllocator staging;
-  // Prepare on-demand backing immediately before the next prefill chunk.
-  std::function<void(std::size_t)> prepare_prefill;
-  // Optional capacity bound before assigning a complete capture. False takes
-  // the ordinary reclamation path; true still requires every allocation.
-  std::function<bool(std::span<const cache::PayloadRequest>)> can_capture;
-  // Optional initialization step after slots allocate. The provider leaves
-  // payload backing uncommitted until serving selects the post-slot budget.
-  std::function<void(std::size_t)> commit_backing;
-  // Optional host bytes the slots pinned and charged to the ledger as they
-  // allocated. Serving charges them on top of the cache's budget, and adds
-  // them back to the runner's claim, which measures the host after them.
-  std::function<std::size_t()> pinned_bytes;
-  cache::PersistenceSource::CopyRows copy_observed_rows;
-  // At most this many transfers of one capture/restore are in flight before
-  // waiting (16 at most). When the shared pool is momentarily exhausted, the
-  // batch settles its own leases and retries. One keeps generic providers
-  // usable without a pool-capacity contract.
-  std::size_t transfer_batch_size{1};
-  std::size_t reassignment_batch_size{1};
-};
-
 class ComponentTextCache {
 public:
   struct Impl;
@@ -75,41 +48,101 @@ public:
     [[nodiscard]] bool restored_from_disk() const noexcept;
     [[nodiscard]] ContinuationLookup lookup() const noexcept;
     [[nodiscard]] bool HasSnapshotFor(std::span<const ContinuationToken>) const;
-    [[nodiscard]] bool TryReserveSnapshot(std::size_t, std::size_t, bool,
-                                          SnapshotPurpose,
-                                          std::span<const ContinuationToken>);
+    [[nodiscard]] bool TryReserveSnapshot(
+        std::size_t, std::size_t, bool = false,
+        SnapshotPurpose = SnapshotPurpose::kContinuation,
+        std::span<const ContinuationToken> = {});
     void SkipSnapshot(SnapshotEventReason, std::size_t, std::size_t) noexcept;
     std::size_t PublishSnapshot(std::vector<ContinuationToken>,
                                 std::shared_ptr<const ContinuationSnapshot>,
-                                bool);
+                                bool = false);
     std::size_t Commit(std::vector<ContinuationToken>,
-                       std::shared_ptr<const ContinuationSnapshot>,
-                       std::vector<ContinuationToken>);
+                       std::shared_ptr<const ContinuationSnapshot> = {},
+                       std::vector<ContinuationToken> = {});
     void Invalidate() noexcept;
     [[nodiscard]] std::size_t CaptureBytes() const;
     [[nodiscard]] std::size_t CaptureBytes(std::size_t boundary) const;
-    [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
+    [[nodiscard]] std::unique_ptr<ContinuationSnapshot> Capture();
     void PreparePrefill(std::size_t tokens);
     [[nodiscard]] ComponentCacheMetrics Metrics() const;
     [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
         std::size_t stable) const;
+    /// Also persists one of the `planned` grid captures: the deepest far
+    /// enough below the prompt checkpoint at `boundary` to serve another
+    /// question about the same prefix after RAM has lost it.
+    void PersistGrid(std::span<const std::size_t> planned,
+                     std::size_t boundary);
 
   private:
     friend class ComponentTextCache;
     std::unique_ptr<Impl> impl_;
   };
+  // Ledger room for index and request metadata when the RAM cache is off. It
+  // caps accounting only; the memory is not reserved. A caller sizing the
+  // ledger from host RAM keeps at least this much, so a host short of its
+  // reserve still loads the model with the cache off.
+  static constexpr std::size_t kOffMetadataBytes = std::size_t{64} << 20;
   // Slots allocate under the larger of ram_bytes and ceiling_bytes, so a
   // smaller budget does not refuse what they pin. The RAM limit then becomes
-  // the budget plus those pins, within the host ceiling.
+  // the budget plus those pins, within the host ceiling. With `ram_enabled`
+  // false, ram_bytes is ignored: no checkpoint stays in RAM and no backing is
+  // committed, unless a disk cache needs some to stage captures.
   ComponentTextCache(std::shared_ptr<TextModelRunner>, std::size_t,
                      std::size_t ram_bytes,
                      const std::optional<TextRunnerDiskCacheOptions>&,
-                     bool automatic_ram = false, std::size_t ceiling_bytes = 0);
+                     bool automatic_ram = false, std::size_t ceiling_bytes = 0,
+                     bool ram_enabled = true);
   ~ComponentTextCache();
+  // With `state_tokens`, the session the prompt lands on claims them from
+  // the shared state budget (StateAccount::Claim), drawing on
+  // `reservation` first. Throws StateMemoryShort when the budget cannot
+  // cover them; the scheduler reserves first, so it does not.
   [[nodiscard]] std::unique_ptr<Lease> Acquire(
-      std::span<const ContinuationToken>,
-      const ContinuationCache::CancellationCheck&,
-      std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool);
+      std::span<const ContinuationToken>, const std::function<bool()>&,
+      std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool,
+      bool persist = true, std::size_t state_tokens = 0,
+      mem::StateReservation* reservation = nullptr);
+  // Whether sessions share their demand-mapped state (#715).
+  [[nodiscard]] bool shared_state() const noexcept;
+  // Bytes a session that holds nothing would charge for `tokens`; zero
+  // without shared state.
+  [[nodiscard]] std::size_t StateBytesFor(std::size_t tokens) const;
+  // Frees state pages of sessions until `bytes` can be charged to the
+  // shared budget: first pages mapped past each session's need (no state
+  // lost), then the live frontiers of idle sessions, the cheapest to lose
+  // first, never the one `prompt` would continue. Unmapping waits for the
+  // device: call it where no model work is in flight (the scheduler, between
+  // work units). Returns whether `bytes` can be charged now.
+  //
+  // A frontier that a disk write still reads in place goes last, and stays
+  // while the write is younger than `write_wait`: dropping it would fail
+  // the write. Admission waits for such writes (kStateWriteWait); a running
+  // request's decode does not wait.
+  [[nodiscard]] bool ReclaimState(std::size_t bytes,
+                                  std::span<const ContinuationToken> prompt,
+                                  const TextPromptContext* context,
+                                  std::chrono::milliseconds write_wait = {});
+  // How long admission keeps an idle frontier for a disk write that reads
+  // it, from the write's capture. Writes queue one after another and share
+  // the disk with restores: three queued 1.9 GB Flash-Next frontiers beside
+  // five disk restores took 15 s. Losing one costs its whole prefill when
+  // the conversation returns (40 s at 66K tokens).
+  static constexpr std::chrono::milliseconds kStateWriteWait{30000};
+  // Host memory pressure from other processes (#932). When `sample` leaves
+  // MemAvailable short of the host reserve (ext::HostReserveShortfallBytes),
+  // gives
+  // RAM-cache memory back to the host until the shortfall plus
+  // kHostPressureReliefBytes is covered, evicting the least valuable
+  // checkpoints as needed (disk copies stay). Returns the bytes released.
+  // Releasing device-mapped pages waits for the device: call it only while
+  // no work runs (the idle scheduler).
+  std::size_t RelieveHostPressure(const ext::HostMemorySample& sample);
+  // Released beyond the shortfall, so that pressure hovering at the reserve
+  // does not release a little on every idle tick.
+  static constexpr std::size_t kHostPressureReliefBytes = std::size_t{2} << 30;
+  // Charged bytes that ReclaimState could free: tails of all sessions and
+  // idle sessions' frontiers.
+  [[nodiscard]] std::size_t ReclaimableStateBytes() const;
   // A disk job is writing a prefix of the prompt much deeper than any
   // restorable boundary; admission may wait for it instead of prefilling.
   // A nonzero checkpoint ID follows that one job, even if another deeper job
@@ -117,61 +150,41 @@ public:
   [[nodiscard]] std::optional<TextPendingPublication> PendingPublication(
       std::span<const ContinuationToken> prompt,
       const TextPromptContext* context, std::uint64_t checkpoint_id = 0) const;
+  // When the checkpoint Acquire would select for `prompt` is only on disk,
+  // starts reading its files into the page cache on a worker and returns a
+  // flag set when that finishes. Null when there is nothing to read, or when
+  // the read would take free pages the host keeps (mem::HostFreeFloorBytes).
+  [[nodiscard]] std::shared_ptr<const std::atomic<bool>> WarmDisk(
+      std::span<const ContinuationToken> prompt,
+      const TextPromptContext* context, std::size_t stable);
   [[nodiscard]] std::size_t CachedPrefixTokens(
       std::span<const ContinuationToken>, const TextPromptContext*,
       bool common = false) const;
+  // Re-tokenizing a conversation can split a previous answer differently from
+  // the tokens the model sampled, and a recurrent frontier cannot rewind to
+  // the first difference (#1154). When the prompt repeats the whole text of an
+  // idle live frontier, replace that part with the frontier's own tokens.
+  // With `trimmed` (a chat template rendered the prompt), whitespace it trimmed
+  // from the edges of a reply stays as the model generated it; whitespace
+  // missing anywhere else is an edit. A frontier ending inside a prompt token
+  // continues with the rest of that token. `stable` follows the rewrite, and
+  // the prompt stays below `max_tokens`. Returns whether the prompt changed.
+  bool AlignToLiveFrontier(std::vector<ContinuationToken>& prompt,
+                           std::size_t& stable, std::size_t max_tokens,
+                           bool trimmed) const;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  // RAM the cache may retain after host limits; zero with the RAM cache off.
+  [[nodiscard]] std::size_t ram_budget() const noexcept;
 
 private:
   std::unique_ptr<Impl> impl_;
 };
 
-// Only one implementation exists for a pool. Legacy models keep their old
-// lease; converted models use the component store and never construct it.
-class ServingCacheLease {
+// The shared state budget cannot cover a request's tokens.
+class StateMemoryShort final : public std::runtime_error {
 public:
-  ServingCacheLease(ContinuationCache::Lease lease)
-      : legacy_(std::move(lease)) {}
-  ServingCacheLease(std::unique_ptr<ComponentTextCache::Lease> lease)
-      : component_(std::move(lease)) {}
-  ServingCacheLease(ServingCacheLease&&) noexcept = default;
-  ServingCacheLease& operator=(ServingCacheLease&&) noexcept = default;
-  [[nodiscard]] explicit operator bool() const noexcept {
-    return component_ || bool(legacy_);
-  }
-  [[nodiscard]] bool component() const noexcept { return bool(component_); }
-  [[nodiscard]] ContinuationState& state() const;
-  [[nodiscard]] bool cache_hit() const noexcept;
-  [[nodiscard]] std::size_t cached_tokens() const noexcept;
-  [[nodiscard]] std::size_t restored_snapshot_bytes() const noexcept;
-  [[nodiscard]] double restore_ms() const noexcept;
-  [[nodiscard]] bool restored_from_disk() const noexcept;
-  [[nodiscard]] ContinuationLookup lookup() const noexcept;
-  [[nodiscard]] bool HasSnapshotFor(std::span<const ContinuationToken>) const;
-  void AdoptRestoredPrefix(std::size_t, std::size_t, double);
-  [[nodiscard]] bool TryReserveSnapshot(
-      std::size_t, std::size_t, bool = false,
-      SnapshotPurpose = SnapshotPurpose::kContinuation,
-      std::span<const ContinuationToken> = {});
-  void SkipSnapshot(SnapshotEventReason, std::size_t, std::size_t) noexcept;
-  std::size_t PublishSnapshot(std::vector<ContinuationToken>,
-                              std::shared_ptr<const ContinuationSnapshot>,
-                              bool = false);
-  std::size_t Commit(std::vector<ContinuationToken>,
-                     std::shared_ptr<const ContinuationSnapshot> = {},
-                     std::vector<ContinuationToken> = {});
-  void Invalidate() noexcept;
-  [[nodiscard]] std::size_t CaptureBytes() const;
-  [[nodiscard]] std::size_t CaptureBytes(std::size_t boundary) const;
-  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
-  void PreparePrefill(std::size_t tokens);
-  [[nodiscard]] std::optional<ComponentCacheMetrics> Metrics() const;
-  [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
-      std::size_t stable) const;
-
-private:
-  ContinuationCache::Lease legacy_;
-  std::unique_ptr<ComponentTextCache::Lease> component_;
+  StateMemoryShort() : std::runtime_error("shared session state exhausted") {}
 };
+
 }  // namespace gufo::server
 #endif

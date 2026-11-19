@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "qfn_mmq.h"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
@@ -186,12 +187,417 @@ void CheckFusedProjection(std::uint32_t tokens) {
   std::cerr << "HC projection fusion exact at " << tokens << " tokens\n";
 }
 
+// A wide prefill pass gets the FFN mixer's inject partials from the
+// attention combine (HcCombineF16 with inject_w); a short pass over the same
+// rows computes them in the mixer epilogue (HcMixEpilogueVec4F16, and
+// HcMixF16Gemm from 96 rows). Each token's partials must not depend on which
+// pass computes them, bit for bit: a 1-ulp difference changes the stream
+// weights of the next combine and with them the greedy tokens.
+void CheckFusedInjectPartials(std::uint32_t tokens) {
+  constexpr std::size_t kRank = 320;
+  constexpr std::size_t kDim = kStreams * kHidden;
+  constexpr float kEps = 1e-6F;
+  const std::uint32_t parts = q::HcInjectPartsVec4(kHidden);
+  const std::size_t rows = std::size_t{tokens} * kDim;
+  const std::size_t inject_count = std::size_t{tokens} * kStreams * parts;
+  HipBuffer<float> d_res(rows), d_block(std::size_t{tokens} * kHidden);
+  HipBuffer<float> d_inject(inject_count), d_gamma(kDim);
+  HipBuffer<float> d_inject_w(kStreams * kDim), d_defer(tokens * kStreams);
+  HipBuffer<float> d_fused(inject_count), d_epilogue(inject_count);
+  HipBuffer<float> d_gemm(inject_count), d_gate(rows);
+  HipBuffer<float> d_mixed(std::size_t{tokens} * kHidden);
+  HipBuffer<__half> d_xn(rows);
+  Upload(&d_res, MakeValues(rows, 0x51CE0001U + tokens, 0.8F));
+  Upload(&d_block,
+         MakeValues(std::size_t{tokens} * kHidden, 0x51CE0002U, 0.3F));
+  Upload(&d_inject, MakeValues(inject_count, 0x51CE0003U, 2.0F));
+  auto gamma = MakeValues(kDim, 0x51CE0004U, 0.5F);
+  for (float& g : gamma)
+    g += 1.0F;
+  Upload(&d_gamma, gamma);
+  Upload(&d_inject_w, MakeValues(kStreams * kDim, 0x51CE0005U, 0.05F));
+  Upload(&d_gate, MakeValues(rows, 0x51CE0006U, 2.0F));
+  if (!q::HcCombineF16(d_res.get(), d_block.get(), d_inject.get(), parts,
+                       d_gamma.get(), d_xn.get(), nullptr, tokens, kHidden,
+                       kStreams, kEps, nullptr, d_defer.get(), d_fused.get(),
+                       d_inject_w.get()))
+    throw std::runtime_error("deferring HC combine rejected");
+  q::HcMixEpilogueVec4F16(d_xn.get(), d_gate.get(), d_inject_w.get(),
+                          d_mixed.get(), nullptr, nullptr, d_epilogue.get(),
+                          tokens, kHidden, nullptr);
+  const auto fused = Download(&d_fused, inject_count);
+  const auto epilogue = Download(&d_epilogue, inject_count);
+  std::size_t diffs = 0;
+  for (std::size_t i = 0; i < inject_count; ++i)
+    diffs += std::memcmp(&fused[i], &epilogue[i], sizeof(float)) != 0;
+  std::cout << "HC inject partials, fused combine vs mixer epilogue at "
+            << tokens << " tokens: " << diffs << " of " << inject_count
+            << " differ\n";
+  if (diffs != 0)
+    throw std::runtime_error("HC inject partials depend on the pass route");
+  if (tokens >= 96) {
+    // The fused projection's partials (HcMixF16Gemm) over the same norm.
+    std::vector<std::uint8_t> weights(kDim * (kRank / 32) * 34, 0);
+    HipBuffer<std::uint8_t> d_up(weights.size());
+    HipBuffer<__half> d_low(std::size_t{tokens} * kRank);
+    CheckHip(hipMemcpy(d_up.get(), weights.data(), d_up.bytes(),
+                       hipMemcpyHostToDevice),
+             "zero up weights");
+    CheckHip(hipMemset(d_low.get(), 0, d_low.bytes()), "zero low rank");
+    if (!q::HcMixF16Gemm(d_up.get(), d_low.get(), d_xn.get(), d_inject_w.get(),
+                         d_mixed.get(), nullptr, nullptr, d_gemm.get(), tokens,
+                         kHidden, kRank, nullptr))
+      throw std::runtime_error("HC fused projection rejected");
+    const auto gemm = Download(&d_gemm, inject_count);
+    if (std::memcmp(gemm.data(), fused.data(), inject_count * sizeof(float)))
+      throw std::runtime_error("HC projection inject partials differ");
+    std::cout << "HC inject partials, fused projection equal at " << tokens
+              << " tokens\n";
+  }
+}
+
+std::vector<std::uint8_t> MakeQ8_0(std::size_t blocks, std::uint32_t seed) {
+  std::vector<std::uint8_t> weights(blocks * 34);
+  for (std::size_t block = 0; block < blocks; ++block) {
+    const __half scale = __float2half_rn(
+        static_cast<float>(1 + NextRandom(&seed) % 13) / 2048.0F);
+    std::memcpy(weights.data() + block * 34, &scale, sizeof(scale));
+    for (std::size_t j = 0; j < 32; ++j) {
+      weights[block * 34 + 2 + j] = static_cast<std::uint8_t>(
+          static_cast<int>(NextRandom(&seed) % 255) - 127);
+    }
+  }
+  return weights;
+}
+
+template<typename T>
+std::vector<std::uint8_t> Bytes(HipBuffer<T>* buffer) {
+  std::vector<std::uint8_t> bytes(buffer->bytes());
+  CheckHip(hipMemcpy(bytes.data(), buffer->get(), bytes.size(),
+                     hipMemcpyDeviceToHost),
+           "download bytes");
+  return bytes;
+}
+
+// Compare the one-launch decode mixer with the scalar or batch sequence,
+// including small unsaturated activations and every active representation,
+// across repeated launches and graph replays (the counters reset).
+enum class MixerReference { Scalar, Batch };
+
+void CheckFusedDecodeMixer(std::uint32_t tokens, bool with_inject,
+                           float input_scale = 1.0F,
+                           MixerReference reference = MixerReference::Scalar) {
+  constexpr std::uint32_t kRank = 320;
+  constexpr std::size_t kDim = std::size_t{kStreams} * kHidden;
+  constexpr float kEps = 1e-6F;
+  const std::uint32_t parts = q::HcInjectParts(kHidden);
+  const std::uint32_t lo_cols =
+      static_cast<std::uint32_t>(qfn_mmq_q8_1_bytes(1, kRank) / 36 * 32);
+  const std::size_t rows = std::size_t{tokens} * kDim;
+  const std::size_t mixed_count = std::size_t{tokens} * kHidden;
+  const std::size_t inject_count = std::size_t{tokens} * kStreams * parts;
+  const auto down = MakeQ8_0(kRank * kDim / 32, 0x5EED0001U + tokens);
+  const auto up = MakeQ8_0(kDim * kRank / 32, 0x5EED0002U + tokens);
+  const auto res = MakeValues(rows, 0x0123ABCDU + tokens, input_scale);
+  const auto block_out =
+      MakeValues(mixed_count, 0x0BADF00DU + tokens, 0.25F * input_scale);
+  const auto inject = MakeValues(inject_count, 0xC0FFEE00U + tokens, 0.05F);
+  auto gamma = MakeValues(kDim, 0x6A6A6A6AU, 0.25F);
+  for (float& g : gamma) {
+    g += 1.0F;
+  }
+  const auto inject_w = MakeValues(kStreams * kDim, 0x1F1F1F1FU, 0.02F);
+
+  HipBuffer<std::uint8_t> d_down(down.size()), d_up(up.size());
+  CheckHip(
+      hipMemcpy(d_down.get(), down.data(), down.size(), hipMemcpyHostToDevice),
+      "down weights");
+  CheckHip(hipMemcpy(d_up.get(), up.data(), up.size(), hipMemcpyHostToDevice),
+           "up weights");
+  HipBuffer<float> d_block_out(mixed_count), d_inject(inject_count);
+  HipBuffer<float> d_gamma(kDim), d_inject_w(kStreams * kDim);
+  Upload(&d_block_out, block_out);
+  Upload(&d_inject, inject);
+  Upload(&d_gamma, gamma);
+  Upload(&d_inject_w, inject_w);
+  HipBuffer<std::uint8_t> d_state(q::HcMixQ8FusedStateBytes());
+  CheckHip(hipMemset(d_state.get(), 0, d_state.bytes()), "clear state");
+  HipBuffer<float> d_gate(rows);
+
+  struct Outputs {
+    explicit Outputs(std::uint32_t n, std::uint32_t lo_cols)
+        : res(std::size_t{n} * kDim),
+          xn(std::size_t{n} * kDim),
+          xn_q8(qfn_mmq_q8_1_bytes(static_cast<int>(n), kDim)),
+          lo(std::size_t{n} * kRank),
+          lo_q8(qfn_mmq_q8_1_bytes(static_cast<int>(n), lo_cols)),
+          mixed(std::size_t{n} * kHidden),
+          mixed_q8(qfn_mmq_q8_1_bytes(static_cast<int>(n), kHidden)),
+          inject(std::size_t{n} * kStreams * q::HcInjectParts(kHidden)) {}
+    HipBuffer<float> res, xn;
+    HipBuffer<std::uint8_t> xn_q8;
+    HipBuffer<float> lo;
+    HipBuffer<std::uint8_t> lo_q8;
+    HipBuffer<float> mixed;
+    HipBuffer<std::uint8_t> mixed_q8;
+    HipBuffer<float> inject;
+  };
+  // Poisons every output (a skipped write cannot match) and reloads res.
+  const auto reset = [&](Outputs* o, unsigned char poison) {
+    CheckHip(hipMemset(o->xn.get(), poison, o->xn.bytes()), "poison");
+    CheckHip(hipMemset(o->xn_q8.get(), poison, o->xn_q8.bytes()), "poison");
+    CheckHip(hipMemset(o->lo.get(), poison, o->lo.bytes()), "poison");
+    CheckHip(hipMemset(o->lo_q8.get(), poison, o->lo_q8.bytes()), "poison");
+    CheckHip(hipMemset(o->mixed.get(), poison, o->mixed.bytes()), "poison");
+    CheckHip(hipMemset(o->mixed_q8.get(), poison, o->mixed_q8.bytes()),
+             "poison");
+    CheckHip(hipMemset(o->inject.get(), poison, o->inject.bytes()), "poison");
+    Upload(&o->res, res);
+  };
+  const float* w_inject = with_inject ? d_inject_w.get() : nullptr;
+  Outputs ref(tokens, lo_cols), out(tokens, lo_cols);
+  reset(&ref, 0x5A);
+  if (reference == MixerReference::Batch) {
+    // Current production CombineBatch/HcMixBatch reference, not the scalar
+    // HcCombineQ8_1/SiluScaleQ8_1 sequence used by the original fused test.
+    q::HcCombine(ref.res.get(), d_block_out.get(), d_inject.get(), parts,
+                 d_gamma.get(), ref.xn.get(), tokens, kHidden, kStreams, kEps,
+                 nullptr, true);
+    if (qfn_mmq_quantize_q8_1(ref.xn.get(), ref.xn_q8.get(), tokens, kDim,
+                              nullptr) != 0 ||
+        qfn_mmq_q8_0_dense_vec_preq(
+            d_down.get(), nullptr, ref.xn_q8.get(), ref.lo.get(), kRank,
+            static_cast<int>(tokens), kDim, nullptr) != 0)
+      throw std::runtime_error("batch down reference rejected");
+    q::SiluScale(ref.lo.get(), 1.0F / kStreams, std::size_t{tokens} * kRank,
+                 nullptr);
+    if (qfn_mmq_quantize_q8_1(ref.lo.get(), ref.lo_q8.get(), tokens, kRank,
+                              nullptr) != 0 ||
+        qfn_mmq_q8_0_dense_vec_preq(
+            d_up.get(), nullptr, ref.lo_q8.get(), d_gate.get(), kDim,
+            static_cast<int>(tokens), kRank, nullptr) != 0)
+      throw std::runtime_error("batch up reference rejected");
+    q::HcMixEpilogue(ref.xn.get(), d_gate.get(), w_inject, ref.mixed.get(),
+                     with_inject ? ref.inject.get() : nullptr, tokens, kHidden,
+                     kStreams, nullptr);
+    if (qfn_mmq_quantize_q8_1(ref.mixed.get(), ref.mixed_q8.get(), tokens,
+                              kHidden, nullptr) != 0)
+      throw std::runtime_error(
+          "batch consumer quantization reference rejected");
+  } else {
+    if (!q::HcCombineQ8_1(ref.res.get(), d_block_out.get(), d_inject.get(),
+                          parts, d_gamma.get(), ref.xn.get(), ref.xn_q8.get(),
+                          tokens, kHidden, kStreams, kEps, nullptr) ||
+        qfn_mmq_q8_0_dense_vec_preq(
+            d_down.get(), nullptr, ref.xn_q8.get(), ref.lo.get(), kRank,
+            static_cast<int>(tokens), kDim, nullptr) != 0 ||
+        !q::SiluScaleQ8_1(ref.lo.get(), 1.0F / kStreams, tokens, kRank, lo_cols,
+                          ref.lo_q8.get(), nullptr) ||
+        qfn_mmq_q8_0_dense_vec_preq(
+            d_up.get(), nullptr, ref.lo_q8.get(), d_gate.get(), kDim,
+            static_cast<int>(tokens), kRank, nullptr) != 0) {
+      throw std::runtime_error("decode mixer reference rejected");
+    }
+    q::HcMixEpilogue(ref.xn.get(), d_gate.get(), w_inject, ref.mixed.get(),
+                     with_inject ? ref.inject.get() : nullptr, tokens, kHidden,
+                     kStreams, nullptr, ref.mixed_q8.get());
+  }
+  CheckHip(hipDeviceSynchronize(), "decode mixer reference");
+
+  const q::HcFusedMix mix{d_down.get(),
+                          d_up.get(),
+                          out.res.get(),
+                          d_block_out.get(),
+                          d_inject.get(),
+                          parts,
+                          d_gamma.get(),
+                          out.xn.get(),
+                          out.xn_q8.get(),
+                          out.lo.get(),
+                          out.lo_q8.get(),
+                          lo_cols,
+                          w_inject,
+                          out.mixed.get(),
+                          out.mixed_q8.get(),
+                          with_inject ? out.inject.get() : nullptr,
+                          kHidden,
+                          kStreams,
+                          kRank,
+                          kEps,
+                          1.0F / kStreams};
+  const auto compare = [&](const char* when) {
+    const auto check = [&](auto& a, auto& b, const char* name) {
+      if (Bytes(&a) != Bytes(&b)) {
+        throw std::runtime_error(std::string("fused decode mixer changed ") +
+                                 name + " (" + when + ", " +
+                                 std::to_string(tokens) + " tokens)");
+      }
+    };
+    check(ref.res, out.res, "res");
+    check(ref.xn, out.xn, "xn");
+    check(ref.xn_q8, out.xn_q8, "xn Q8_1");
+    check(ref.lo, out.lo, "lo");
+    // Only each row's ten blocks are written; its padding keeps the poison.
+    const auto lo_ref = Bytes(&ref.lo_q8);
+    const auto lo_out = Bytes(&out.lo_q8);
+    for (std::uint32_t t = 0; t < tokens; ++t) {
+      const auto row = static_cast<std::ptrdiff_t>(t * lo_cols / 32 * 36);
+      if (!std::equal(lo_ref.begin() + row,
+                      lo_ref.begin() + row + kRank / 32 * 36,
+                      lo_out.begin() + row)) {
+        throw std::runtime_error(std::string("fused decode mixer changed ") +
+                                 "lo Q8_1 (" + when + ", " +
+                                 std::to_string(tokens) + " tokens)");
+      }
+    }
+    check(ref.mixed, out.mixed, "mixed");
+    check(ref.mixed_q8, out.mixed_q8, "mixed Q8_1");
+    if (with_inject) {
+      check(ref.inject, out.inject, "inject partials");
+    }
+  };
+  // Eager launches, then a captured graph replayed from poisoned outputs.
+  for (int launch = 0; launch < 3; ++launch) {
+    reset(&out, static_cast<unsigned char>(0xA5 + launch));
+    if (!q::HcMixQ8Fused(d_state.get(), mix, tokens, nullptr)) {
+      throw std::runtime_error("fused decode mixer rejected");
+    }
+    CheckHip(hipDeviceSynchronize(), "fused decode mixer");
+    compare("eager");
+  }
+  if (with_inject) {
+    // Decode reads and rewrites one inject buffer (s_.inject).
+    reset(&out, 0x77);
+    Upload(&out.inject, inject);
+    q::HcFusedMix aliased = mix;
+    aliased.inject = out.inject.get();
+    if (!q::HcMixQ8Fused(d_state.get(), aliased, tokens, nullptr)) {
+      throw std::runtime_error("fused decode mixer rejected");
+    }
+    CheckHip(hipDeviceSynchronize(), "aliased fused decode mixer");
+    compare("in-place inject");
+  }
+  hipStream_t stream = nullptr;
+  CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t exec = nullptr;
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal),
+           "capture");
+  const bool captured = q::HcMixQ8Fused(d_state.get(), mix, tokens, stream);
+  CheckHip(hipStreamEndCapture(stream, &graph), "capture end");
+  if (!captured) {
+    throw std::runtime_error("fused decode mixer capture rejected");
+  }
+  CheckHip(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+           "instantiate");
+  for (int replay = 0; replay < 3; ++replay) {
+    reset(&out, static_cast<unsigned char>(0x3C + replay));
+    // The poison memsets run on the legacy NULL stream, which does not
+    // order with launches on this non-blocking stream; drain them before
+    // replaying, the idiom the eager paths above already use.
+    CheckHip(hipDeviceSynchronize(), "poison drain");
+    CheckHip(hipGraphLaunch(exec, stream), "replay");
+    CheckHip(hipStreamSynchronize(stream), "replay sync");
+    compare("graph replay");
+  }
+  (void)hipGraphExecDestroy(exec);
+  (void)hipGraphDestroy(graph);
+  (void)hipStreamDestroy(stream);
+  // Guards: the compared outputs are finite and carry real signal.
+  for (auto* buffer : {&out.res, &out.xn, &out.lo, &out.mixed}) {
+    const auto values = Download(buffer, buffer->bytes() / sizeof(float));
+    std::size_t nonzero = 0;
+    for (const float v : values) {
+      if (!std::isfinite(v)) {
+        throw std::runtime_error("fused decode mixer output not finite");
+      }
+      nonzero += v != 0.0F;
+    }
+    if (nonzero * 10 < values.size() * 9) {
+      throw std::runtime_error("fused decode mixer output mostly zero");
+    }
+  }
+  std::cout << "HC fused decode mixer exact at " << tokens << " tokens"
+            << (with_inject ? " with" : " without") << " inject\n";
+}
+
 }  // namespace
+
+void CheckBatchedReadyQ8(std::uint32_t rows, bool inject, float scale) {
+  constexpr std::size_t guard = 256;
+  const auto input = MakeValues(std::size_t{rows} * kHidden * kStreams,
+                                0x572100U + rows, scale);
+  const auto gates = MakeValues(input.size(), 0x781900U + rows, 2.0F);
+  const auto weights =
+      MakeValues(kStreams * kHidden * kStreams, 0x124003U, 0.01F);
+  HipBuffer<float> x(input.size()), g(gates.size()), w(weights.size());
+  Upload(&x, input);
+  Upload(&g, gates);
+  Upload(&w, weights);
+  const auto mixed_bytes = std::size_t{rows} * kHidden * sizeof(float);
+  const auto inject_bytes =
+      std::size_t{rows} * kStreams * q::HcInjectParts(kHidden) * sizeof(float);
+  const auto q8_bytes = qfn_mmq_q8_1_bytes(rows, kHidden);
+  HipBuffer<std::uint8_t> ref_mixed(mixed_bytes + 2 * guard),
+      out_mixed(mixed_bytes + 2 * guard), ref_inject(inject_bytes + 2 * guard),
+      out_inject(inject_bytes + 2 * guard), ref_q8(q8_bytes + 2 * guard),
+      out_q8(q8_bytes + 2 * guard);
+  for (auto* b :
+       {&ref_mixed, &out_mixed, &ref_inject, &out_inject, &ref_q8, &out_q8})
+    CheckHip(hipMemset(b->get(), 0xA5, b->bytes()), "ready-Q8 guards");
+  auto floats = [&](auto& b) {
+    return reinterpret_cast<float*>(b.get() + guard);
+  };
+  q::HcMixEpilogue(x.get(), g.get(), inject ? w.get() : nullptr,
+                   floats(ref_mixed), floats(ref_inject), rows, kHidden,
+                   kStreams, nullptr);
+  if (qfn_mmq_quantize_q8_1(floats(ref_mixed), ref_q8.get() + guard, rows,
+                            kHidden, nullptr) != 0)
+    throw std::runtime_error("ready-Q8 reference quantization failed");
+  q::HcMixEpilogue(x.get(), g.get(), inject ? w.get() : nullptr,
+                   floats(out_mixed), floats(out_inject), rows, kHidden,
+                   kStreams, nullptr, out_q8.get() + guard);
+  CheckHip(hipDeviceSynchronize(), "ready-Q8 completion");
+  const auto exact = [&](auto& a, auto& b, std::size_t used, bool live) {
+    std::vector<std::uint8_t> reference(a.bytes()), actual(b.bytes());
+    CheckHip(
+        hipMemcpy(reference.data(), a.get(), a.bytes(), hipMemcpyDeviceToHost),
+        "ready-Q8 reference");
+    CheckHip(
+        hipMemcpy(actual.data(), b.get(), b.bytes(), hipMemcpyDeviceToHost),
+        "ready-Q8 producer");
+    if (reference != actual)
+      throw std::runtime_error("ready-Q8 producer differs from separate path");
+    for (std::size_t i = 0; i < actual.size(); ++i)
+      if ((!live || i < guard || i >= guard + used) && actual[i] != 0xA5)
+        throw std::runtime_error("ready-Q8 guard or inactive output changed");
+  };
+  exact(ref_mixed, out_mixed, mixed_bytes, true);
+  exact(ref_inject, out_inject, inject_bytes, inject);
+  exact(ref_q8, out_q8, q8_bytes, true);
+}
 
 int main() {
   try {
+    for (std::uint32_t n = 1; n <= 8; ++n) {
+      CheckFusedDecodeMixer(n, true);
+    }
+    for (std::uint32_t rows = 1; rows <= 8; ++rows)
+      for (bool inject : {false, true})
+        for (float scale : {0.0001F, 1.0F, 10000.0F})
+          CheckBatchedReadyQ8(rows, inject, scale);
+    CheckFusedDecodeMixer(1, false);
+    CheckFusedDecodeMixer(5, false);
+    // Target-batch routing changes must also match the separately launched
+    // CombineBatch/HcMixBatch arithmetic, with small unsaturated inputs.
+    for (std::uint32_t n = 1; n <= 8; ++n)
+      for (bool with_inject : {false, true})
+        for (float scale : {0.0001F, 1.0F, 10000.0F})
+          CheckFusedDecodeMixer(n, with_inject, scale, MixerReference::Batch);
     CheckFusedProjection(96);
     CheckFusedProjection(2049);
+    for (std::uint32_t n : {7U, 96U, 1619U})
+      CheckFusedInjectPartials(n);
     constexpr std::size_t kHcDim = static_cast<std::size_t>(kHidden) * kStreams;
     constexpr std::size_t kRows = static_cast<std::size_t>(kTokens) * kHcDim;
     constexpr std::size_t kMixed = static_cast<std::size_t>(kTokens) * kHidden;

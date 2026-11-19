@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "src/cli/serve/multipart.hpp"
 #include "src/core/json.hpp"
 #include "src/core/utf8.hpp"
 
@@ -25,25 +26,13 @@ namespace {
 constexpr std::string_view kTranscriptionsPath = "/v1/audio/transcriptions";
 constexpr std::size_t kMaximumTextFieldBytes = 16U << 10U;
 constexpr std::size_t kMaximumNewTokens = 512;
+constexpr std::size_t kMaximumFields = 12;
 
 struct MultipartPart {
-  std::string filename;
   std::string body;
 };
 
 using Multipart = std::unordered_map<std::string, MultipartPart>;
-
-std::string_view Trim(std::string_view value) {
-  while (!value.empty() &&
-         std::isspace(static_cast<unsigned char>(value.front())) != 0) {
-    value.remove_prefix(1);
-  }
-  while (!value.empty() &&
-         std::isspace(static_cast<unsigned char>(value.back())) != 0) {
-    value.remove_suffix(1);
-  }
-  return value;
-}
 
 std::string Lower(std::string_view value) {
   std::string result(value);
@@ -71,124 +60,6 @@ HttpResponse Error(int status, std::string reason, std::string message,
   };
 }
 
-std::optional<std::string> Parameter(std::string_view value,
-                                     std::string_view name) {
-  const std::string target = Lower(name);
-  std::size_t begin = 0;
-  while (begin < value.size()) {
-    const std::size_t semicolon = value.find(';', begin);
-    const std::size_t end =
-        semicolon == std::string_view::npos ? value.size() : semicolon;
-    const std::string_view item = Trim(value.substr(begin, end - begin));
-    const std::size_t equals = item.find('=');
-    if (equals != std::string_view::npos &&
-        Lower(Trim(item.substr(0, equals))) == target) {
-      std::string_view parameter = Trim(item.substr(equals + 1U));
-      if (parameter.size() >= 2U && parameter.front() == '"' &&
-          parameter.back() == '"') {
-        parameter.remove_prefix(1);
-        parameter.remove_suffix(1);
-      }
-      if (parameter.find_first_of("\r\n") != std::string_view::npos) {
-        return std::nullopt;
-      }
-      return std::string(parameter);
-    }
-    if (semicolon == std::string_view::npos) {
-      break;
-    }
-    begin = semicolon + 1U;
-  }
-  return std::nullopt;
-}
-
-bool ExtractBoundary(std::string_view content_type, std::string* boundary) {
-  const std::size_t semicolon = content_type.find(';');
-  const std::string media_type = Lower(Trim(content_type.substr(0, semicolon)));
-  if (media_type != "multipart/form-data") {
-    return false;
-  }
-  const std::optional<std::string> parsed = Parameter(content_type, "boundary");
-  if (!parsed.has_value() || parsed->empty() || parsed->size() > 70U ||
-      parsed->find_first_of("\r\n") != std::string::npos) {
-    return false;
-  }
-  *boundary = *parsed;
-  return true;
-}
-
-bool ParseMultipart(std::string_view body, std::string_view boundary,
-                    Multipart* output, std::string* error) {
-  const std::string delimiter = "--" + std::string(boundary);
-  if (!body.starts_with(delimiter)) {
-    *error = "multipart body does not start with its boundary";
-    return false;
-  }
-  std::size_t cursor = delimiter.size();
-  while (true) {
-    if (body.substr(cursor, 2U) == "--") {
-      return true;
-    }
-    if (body.substr(cursor, 2U) != "\r\n") {
-      *error = "multipart boundary is malformed";
-      return false;
-    }
-    cursor += 2U;
-    const std::size_t headers_end = body.find("\r\n\r\n", cursor);
-    if (headers_end == std::string_view::npos ||
-        headers_end - cursor > kMaximumTextFieldBytes) {
-      *error = "multipart part headers are malformed";
-      return false;
-    }
-
-    std::string disposition;
-    for (std::size_t line_begin = cursor; line_begin < headers_end;) {
-      const std::size_t line_end = body.find("\r\n", line_begin);
-      const std::size_t bounded_end =
-          line_end == std::string_view::npos || line_end > headers_end
-              ? headers_end
-              : line_end;
-      const std::string_view line =
-          body.substr(line_begin, bounded_end - line_begin);
-      const std::size_t colon = line.find(':');
-      if (colon != std::string_view::npos &&
-          Lower(Trim(line.substr(0, colon))) == "content-disposition") {
-        disposition = std::string(Trim(line.substr(colon + 1U)));
-      }
-      if (bounded_end == headers_end) {
-        break;
-      }
-      line_begin = bounded_end + 2U;
-    }
-    const std::optional<std::string> name = Parameter(disposition, "name");
-    if (!name.has_value() || name->empty()) {
-      *error = "multipart part is missing a field name";
-      return false;
-    }
-
-    const std::size_t payload_begin = headers_end + 4U;
-    const std::string next_marker = "\r\n" + delimiter;
-    const std::size_t next = body.find(next_marker, payload_begin);
-    if (next == std::string_view::npos) {
-      *error = "multipart body is missing a closing boundary";
-      return false;
-    }
-    MultipartPart part{
-        .filename = Parameter(disposition, "filename").value_or(""),
-        .body = std::string(body.substr(payload_begin, next - payload_begin)),
-    };
-    if (!output->emplace(*name, std::move(part)).second) {
-      *error = "multipart field is duplicated: " + *name;
-      return false;
-    }
-    if (output->size() > 12U) {
-      *error = "multipart request contains too many fields";
-      return false;
-    }
-    cursor = next + 2U + delimiter.size();
-  }
-}
-
 const MultipartPart* Find(const Multipart& parts, std::string_view name) {
   const auto iterator = parts.find(std::string(name));
   return iterator == parts.end() ? nullptr : &iterator->second;
@@ -207,17 +78,7 @@ bool ParsePositiveSize(std::string_view value, std::size_t maximum,
   return true;
 }
 
-bool IsKnownField(std::string_view name) {
-  static constexpr std::string_view kKnown[] = {
-      "file",       "model",           "language",
-      "prompt",     "response_format", "temperature",
-      "max_tokens", "stream",          "timestamp_granularities[]",
-  };
-  return std::ranges::find(kKnown, name) != std::end(kKnown);
-}
-
-std::string ServerTiming(
-    const models::qwen3_asr::TranscriptionTimings& timings) {
+std::string ServerTiming(const ext::TranscriptionTimings& timings) {
   std::ostringstream value;
   value << "decode_audio;dur=" << timings.decode_audio_ms
         << ", features;dur=" << timings.feature_extraction_ms
@@ -227,35 +88,40 @@ std::string ServerTiming(
 }
 
 HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
-  std::string boundary;
-  if (!ExtractBoundary(request.header("content-type"), &boundary)) {
+  Multipart parts;
+  MultipartResult form = ParseMultipart(
+      request.header("content-type"), request.body,
+      {.max_fields = kMaximumFields, .unique_names = true},
+      [&parts](const MultipartField& field) {
+        parts.emplace(std::string(field.name),
+                      MultipartPart{.body = std::string(field.content)});
+        return true;
+      });
+  if (form.status == MultipartStatus::kNotFormData ||
+      form.status == MultipartStatus::kBadBoundary) {
     return Error(400, "Bad Request",
                  "Content-Type must be multipart/form-data with a boundary",
                  "invalid_content_type");
   }
-  Multipart parts;
-  std::string parse_error;
-  if (!ParseMultipart(request.body, boundary, &parts, &parse_error)) {
-    return Error(400, "Bad Request", std::move(parse_error),
+  if (form.status == MultipartStatus::kTooManyFields) {
+    form.detail = "multipart request contains too many fields";
+  } else if (form.status == MultipartStatus::kDuplicateField) {
+    form.detail = "multipart field is duplicated: " + form.detail;
+  }
+  if (form.status != MultipartStatus::kComplete) {
+    return Error(400, "Bad Request", std::move(form.detail),
                  "invalid_multipart");
   }
-  for (const auto& [name, unused] : parts) {
-    (void)unused;
-    if (!IsKnownField(name)) {
-      return Error(400, "Bad Request",
-                   "unsupported transcription field: " + name,
-                   "unsupported_field");
-    }
-  }
+  // As in vLLM and the other OpenAI-compatible servers, unknown fields are
+  // ignored.
 
   const MultipartPart* file = Find(parts, "file");
   if (file == nullptr || file->body.empty()) {
-    return Error(400, "Bad Request", "a non-empty WAV 'file' is required",
+    return Error(400, "Bad Request", "a non-empty audio 'file' is required",
                  "missing_file");
   }
   const MultipartPart* model = Find(parts, "model");
-  if (model != nullptr && model->body != service.model_id() &&
-      model->body != "qwen3-asr" && model->body != "qwen3-asr-1.7b") {
+  if (model != nullptr && !service.serves_model(model->body)) {
     return Error(400, "Bad Request", "unsupported transcription model",
                  "invalid_model");
   }
@@ -292,6 +158,11 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
   if (Find(parts, "timestamp_granularities[]") != nullptr) {
     return Error(400, "Bad Request",
                  "timestamp granularities are not supported",
+                 "unsupported_option");
+  }
+  // `include[]` only requests logprobs, which this server cannot return.
+  if (Find(parts, "include[]") != nullptr) {
+    return Error(400, "Bad Request", "transcription logprobs are not supported",
                  "unsupported_option");
   }
   bool stream = false;
@@ -353,7 +224,7 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
             published = text;
             return send(std::move(event));
           };
-          models::qwen3_asr::TranscriptionRequest input{
+          ext::TranscriptionRequest input{
               .wav = {reinterpret_cast<const std::byte*>(wav.data()),
                       wav.size()},
               .context = context,
@@ -361,13 +232,15 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
               .max_new_tokens = maximum_tokens,
               .on_text = progress,
           };
-          models::qwen3_asr::TranscriptionResult result;
+          ext::TranscriptionResult result;
           std::string error;
           const auto stop = [&] {
             return !connected || (cancelled && cancelled());
           };
           if (!service.Transcribe(input, stop, &result, &error)) {
-            log->error_code = stop() ? "cancelled" : "transcription_failed";
+            log->error_code = stop()                 ? "cancelled"
+                              : result.invalid_audio ? "invalid_audio_input"
+                                                     : "transcription_failed";
             if (!stop()) {
               auto event = json::Value::object();
               event["type"] = "error";
@@ -390,10 +263,10 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
         };
     return response;
   }
-  models::qwen3_asr::TranscriptionResult result;
+  ext::TranscriptionResult result;
   std::string error;
   if (!service.Transcribe(
-          models::qwen3_asr::TranscriptionRequest{
+          ext::TranscriptionRequest{
               .wav = std::span<const std::byte>(wav_data, file->body.size()),
               .context = prompt == nullptr ? std::string{} : prompt->body,
               .language = language == nullptr || language->body.empty()
@@ -405,6 +278,9 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
     if (request.is_cancelled && request.is_cancelled()) {
       return Error(499, "Client Closed Request", "transcription cancelled",
                    "cancelled");
+    }
+    if (result.invalid_audio) {
+      return Error(400, "Bad Request", std::move(error), "invalid_audio_input");
     }
     return Error(500, "Internal Server Error", std::move(error),
                  "transcription_failed");

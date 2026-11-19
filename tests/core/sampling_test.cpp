@@ -1,15 +1,21 @@
 #include "src/core/sampling.hpp"
 
+#include <algorithm>
 #include <bit>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "src/core/json.hpp"
 #include "src/core/json_constraint.hpp"
+#include "src/core/sampling_logit_row.hpp"
 
 namespace {
 
@@ -25,6 +31,37 @@ void Expect(bool condition, std::string_view message) {
   if (!condition) {
     std::cerr << "FAILED: " << message << '\n';
     std::exit(1);
+  }
+}
+
+void TestBlockMaximum() {
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float inf = std::numeric_limits<float>::infinity();
+  // Start unaligned and end at the allocation boundary. Exercise every
+  // masked tail, NaNs in either max operand, infinities and negative rows.
+  for (std::size_t n = 0; n <= 129; ++n) {
+    std::vector<float> values(n + 1, nan);
+    auto block = std::span(values).subspan(1);
+    for (int kind = 0; kind < 4; ++kind) {
+      for (std::size_t i = 0; i < n; ++i)
+        block[i] = kind == 0    ? nan
+                   : kind == 1  ? -inf
+                   : i % 7 == 0 ? nan
+                                : -static_cast<float>(i + 1);
+      if (kind == 3 && n != 0)
+        block[n - 1] = inf;
+      float expected = -inf;
+      for (float value : block)
+        expected = value > expected ? value : expected;
+      Expect(gufo::sampling::BlockMaximum(block) == expected,
+             "block maximum ignores NaN and handles every tail");
+    }
+    for (std::size_t winner = 0; winner < n; ++winner) {
+      std::fill(block.begin(), block.end(), -inf);
+      block[winner] = winner % 2 == 0 ? 0.0F : -0.0F;
+      Expect(gufo::sampling::BlockMaximum(block) == 0.0F,
+             "block maximum finds each lane including signed zero");
+    }
   }
 }
 
@@ -83,6 +120,51 @@ void TestReasoningBudgetForcesTheEnd() {
   Expect(copy.Sample(Logits(6)) == 6, "the answer is sampled normally");
   copy.ResetHistory({});
   Expect(!copy.ForcedToken(), "a restart resets the reasoning budget");
+}
+
+void TestReasoningBudgetWaitsForOpener() {
+  auto budget = std::make_shared<ReasoningBudget>(*Budget(2));
+  budget->opener = 9;
+  budget->blank = std::make_shared<std::vector<bool>>(
+      std::vector<bool>{false, true, false});
+  SamplingConfig config;
+  config.reasoning_budget = budget;
+  SamplerState opened(config);
+  opened.Accept(1);
+  opened.Accept(9);
+  Expect(!opened.ForcedToken(), "the opener itself spends no budget");
+  opened.Accept(2);
+  opened.Accept(2);
+  Expect(opened.ForcedToken() == TokenId{3},
+         "a self-opened block spends the budget");
+
+  SamplerState text(config);
+  text.Accept(2);
+  text.Accept(9);
+  text.Accept(2);
+  text.Accept(2);
+  Expect(!text.ForcedToken(), "an opener after text does not start a budget");
+
+  SamplerState closed(config);
+  closed.Accept(9);
+  closed.Accept(3);
+  closed.Accept(2);
+  closed.Accept(2);
+  Expect(!closed.ForcedToken(), "a closed block ends a self-opened budget");
+
+  auto zero = std::make_shared<ReasoningBudget>(*budget);
+  zero->tokens = 0;
+  config.reasoning_budget = zero;
+  SamplerState immediate(config);
+  Expect(!immediate.ForcedToken(), "no budget is spent before the opener");
+  immediate.Accept(9);
+  Expect(immediate.ForcedToken() == TokenId{3},
+         "a zero budget forces after the opener");
+
+  SamplerState copied(immediate);
+  Expect(copied.ForcedToken() == TokenId{3}, "a copy keeps the opened budget");
+  copied.ResetHistory({});
+  Expect(!copied.ForcedToken(), "a reset waits for the opener again");
 }
 
 void TestEarlyEndAndNoBudget() {
@@ -202,6 +284,77 @@ void TestReasoningBudgetWithGrammar() {
          "after the forced end the answer still follows the grammar");
 }
 
+// The grammar decides when reasoning ends: the close spelled as ordinary
+// text, or a native call header, ends it before the budget runs out, and the
+// budget must not force its close into the answer afterwards.
+void TestReasoningBudgetFollowsGrammarEnd() {
+  const auto generate = [](std::shared_ptr<const JsonConstraint> grammar,
+                           const std::vector<std::string>& pieces,
+                           std::size_t tokens,
+                           const std::vector<TokenId>& reasoning,
+                           const std::vector<TokenId>& preferred) {
+    auto binding = std::make_shared<TokenConstraint>();
+    binding->grammar = std::move(grammar);
+    binding->vocabulary = std::make_shared<ConstraintVocabulary>(
+        pieces.size(), [&](std::uint32_t i) {
+          return ConstraintVocabulary::Piece{pieces[i], pieces[i].empty()};
+        });
+    SamplingConfig config;
+    config.constraint = binding;
+    auto budget = std::make_shared<ReasoningBudget>();
+    budget->tokens = tokens;
+    budget->forced = {1};
+    budget->ends = {1};
+    config.reasoning_budget = budget;
+    SamplerState sampler(config);
+    std::string text;
+    try {
+      sampler.Accept(reasoning);
+      for (const auto token : reasoning)
+        text += pieces[token];
+      for (const auto token : preferred) {
+        std::vector<float> logits(pieces.size(), 0.0F);
+        logits[token] = 5.0F;
+        const auto sampled = sampler.Sample(logits);
+        sampler.Accept(sampled);
+        text += pieces[sampled];
+      }
+    } catch (const std::exception& error) {
+      text += std::string("[") + error.what() + "]";
+    }
+    return text;
+  };
+
+  const auto json = JsonConstraint::WithReasoning(JsonConstraint::Object());
+  const std::vector<std::string> pieces{"thinking", "</think>", "</", "think>",
+                                        "{\"x\":",  "true}",    ""};
+  const auto spelled = generate(json, pieces, 4, {0, 2, 3, 4}, {5, 6});
+  Expect(spelled == "thinking</think>{\"x\":true}",
+         "a close spelled as text ends the budget too, got " + spelled);
+  const auto spent = generate(json, pieces, 4, {0, 0, 0, 2}, {4, 4, 5, 6});
+  Expect(spent == "thinkingthinkingthinking</</think>{\"x\":true}",
+         "a partial close still reasons and the budget forces the end, got " +
+             spent);
+
+  const auto arguments = JsonConstraint::ToolParameters(
+      gufo::json::parse(R"({"type":"object",
+        "properties":{"value":{"type":"string","const":"42"}},
+        "required":["value"],"additionalProperties":false})"),
+      true, JsonConstraint::ToolFormat::kDeepSeek);
+  const auto tools = JsonConstraint::WithReasoning(
+      JsonConstraint::WithTools(nullptr, {{"record", arguments}}, true, false,
+                                JsonConstraint::ToolFormat::kDeepSeek));
+  const std::vector<std::string> native{
+      "thinking", "</think>",
+      "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"record\">\n",
+      "<｜DSML｜parameter name=\"value\" string=\"true\">42"
+      "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+      ""};
+  const auto called = generate(tools, native, 2, {0, 2}, {3, 4});
+  Expect(called == native[0] + native[2] + native[3],
+         "a native call header ends the budget too, got " + called);
+}
+
 void TestCompactTargetContract() {
   using gufo::sampling::LogitCandidate;
   const std::vector<float> logits{0.0F, 0.75F, -1.0F, 0.75F, 3.0F, 0.1F};
@@ -242,15 +395,171 @@ void TestCompactTargetContract() {
   }
 }
 
+// The top-p filter over a large vocabulary must equal the definition: sort the
+// finite penalized logits, find the shortest prefix whose softmax mass reaches
+// top_p times the index-order sum over every token, and normalize that prefix.
+// The rows cover a wide nucleus, a penalized maximum and non-finite logits.
+void TestTopPOverLargeVocabularyMatchesDefinition() {
+  constexpr std::size_t kVocabulary = 5000;
+  std::uint64_t lcg = 0x9e3779b97f4a7c15ULL;
+  const auto uniform = [&] {
+    lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<float>(lcg >> 40) / static_cast<float>(1U << 24);
+  };
+  for (const std::size_t nucleus : {std::size_t{3}, std::size_t{900}}) {
+    std::vector<float> logits(kVocabulary);
+    for (auto& logit : logits)
+      logit = 6.0F * uniform() - 3.0F;
+    for (std::size_t i = 0; i < nucleus; ++i)
+      logits[(i * 7919 + 13) % kVocabulary] = 8.0F + 0.5F * uniform();
+    logits[17] = std::nanf("");
+    logits[18] = INFINITY;
+    logits[19] = -INFINITY;
+    for (const float temperature : {0.8F, 1.0F}) {
+      SamplingConfig config;
+      config.temperature = temperature;
+      config.top_p = 0.9F;
+      config.frequency_penalty = 0.37F;
+      SamplerState state(config);
+      const TokenId strongest = static_cast<TokenId>(
+          std::max_element(logits.begin() + 20, logits.end()) - logits.begin());
+      state.Accept(strongest);
+      state.Accept(strongest);
+      const auto actual = state.Distribution(logits);
+
+      std::vector<gufo::sampling::Probability> sorted;
+      for (std::size_t i = 0; i < kVocabulary; ++i) {
+        if (!std::isfinite(logits[i]))
+          continue;
+        double value = logits[i];
+        if (i == strongest)
+          value -= static_cast<double>(config.frequency_penalty) * 2;
+        sorted.push_back({static_cast<TokenId>(i), value});
+      }
+      std::ranges::sort(sorted, [](const auto& a, const auto& b) {
+        return a.value == b.value ? a.token < b.token : a.value > b.value;
+      });
+      const double maximum = sorted.front().value;
+      std::vector<double> terms;
+      for (const auto& entry : sorted)
+        terms.push_back(std::exp((entry.value - maximum) / temperature));
+      double sum = 0;
+      for (std::size_t i = 0; i < kVocabulary; ++i) {
+        if (!std::isfinite(logits[i]))
+          continue;
+        const double value =
+            i == strongest
+                ? logits[i] - static_cast<double>(config.frequency_penalty) * 2
+                : logits[i];
+        sum += std::exp((value - maximum) / temperature);
+      }
+      const double target = static_cast<double>(config.top_p) * sum;
+      double cumulative = 0;
+      std::size_t keep = 0;
+      while (keep < terms.size()) {
+        cumulative += terms[keep++];
+        if (cumulative >= target)
+          break;
+      }
+      double total = 0;
+      for (std::size_t i = 0; i < keep; ++i)
+        total += terms[i];
+      const auto entries = actual.entries();
+      Expect(entries.size() == keep, "top-p keeps the defined prefix");
+      for (std::size_t i = 0; i < keep; ++i)
+        Expect(entries[i].token == sorted[i].token &&
+                   std::bit_cast<std::uint64_t>(entries[i].value) ==
+                       std::bit_cast<std::uint64_t>(terms[i] / total),
+               "top-p probabilities are bit-exact");
+    }
+  }
+}
+
 }  // namespace
 
+void TestRawLogprobs() {
+  using gufo::sampling::CollectLogprobs;
+  const std::vector<float> logits{1000, 999, 998, -1000};
+  const auto result = CollectLogprobs(logits, 3, 2);
+  const double denominator = std::log(1.0 + std::exp(-1.0) + std::exp(-2.0));
+  Expect(std::abs(result->selected.logprob - (-2000.0 - denominator)) < 1e-12,
+         "stable log-softmax retains very unlikely selected tokens");
+  Expect(result->top.size() == 2 && result->top[0].token == 0 &&
+             result->top[1].token == 1,
+         "alternatives come from the complete raw vocabulary");
+  Expect(!CollectLogprobs({}, 999, std::nullopt),
+         "disabled collection does no work");
+  Expect(CollectLogprobs(logits, 0, 0)->top.empty(),
+         "zero requests selected token only");
+  const auto tied = CollectLogprobs(std::vector<float>{0, 0, 0}, 2, 20);
+  Expect(tied->top.size() == 3 && tied->top[0].token == 0 &&
+             std::abs(tied->selected.logprob + std::log(3.0)) < 1e-12,
+         "ties have deterministic token order and exact normalization");
+  const auto twenty = CollectLogprobs(std::vector<float>(32, 0), 31, 20);
+  Expect(twenty->top.size() == 20 && twenty->top.back().token == 19 &&
+             twenty->selected.token == 31,
+         "twenty alternatives retain an independently selected token");
+  const std::vector<std::string> pieces{"prose", "{", "}", ""};
+  auto binding = std::make_shared<TokenConstraint>();
+  binding->grammar = JsonConstraint::Object();
+  binding->vocabulary = std::make_shared<ConstraintVocabulary>(
+      pieces.size(), [&](std::uint32_t i) {
+        return ConstraintVocabulary::Piece{pieces[i], i == 3};
+      });
+  SamplingConfig constrained;
+  constrained.constraint = binding;
+  constrained.logprobs = 2;
+  SamplerState grammar(constrained);
+  const auto selected = grammar.Sample(logits);
+  const auto raw = CollectLogprobs(logits, selected, constrained.logprobs);
+  Expect(selected == 1 && raw->top[0].token == 0 &&
+             std::abs(raw->selected.logprob + 1 + denominator) < 1e-12,
+         "grammar masks change selection but not raw probabilities");
+  for (const float temperature : {0.F, 0.7F}) {
+    SamplingConfig config;
+    config.temperature = temperature;
+    config.top_k = 2;
+    config.presence_penalty = 0.5;
+    config.seed = 42;
+    SamplerState plain(config);
+    config.logprobs = 2;
+    SamplerState observed(config);
+    for (int i = 0; i < 16; ++i) {
+      const auto a = plain.Sample(logits), b = observed.Sample(logits);
+      const auto probabilities = CollectLogprobs(logits, b, config.logprobs);
+      Expect(a == b && plain.rng_state() == observed.rng_state(),
+             "observation preserves selection and RNG");
+      Expect(std::abs(probabilities->top[0].logprob + denominator) < 1e-12,
+             "raw logprobs ignore temperature, truncation and penalties");
+      plain.Accept(a);
+      observed.Accept(b);
+    }
+  }
+  for (const auto invalid :
+       {std::vector<float>{INFINITY}, std::vector<float>{NAN},
+        std::vector<float>{-INFINITY}}) {
+    bool failed = false;
+    try {
+      (void)CollectLogprobs(invalid, 0, 0);
+    } catch (const std::runtime_error&) {
+      failed = true;
+    }
+    Expect(failed, "invalid raw distributions fail explicitly");
+  }
+}
+
 int main() {
+  TestBlockMaximum();
+  TestRawLogprobs();
   TestReasoningBudgetForcesTheEnd();
+  TestReasoningBudgetWaitsForOpener();
   TestEarlyEndAndNoBudget();
   TestReasoningBudgetMatchesLlamaCpp();
   TestReasoningBudgetKeepsLiteralAnswer();
   TestReasoningBudgetWithGrammar();
+  TestReasoningBudgetFollowsGrammarEnd();
   TestCompactTargetContract();
+  TestTopPOverLargeVocabularyMatchesDefinition();
   std::cout << "sampling_test passed\n";
   return 0;
 }

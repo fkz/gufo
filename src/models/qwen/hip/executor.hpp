@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <gufo/ext/model_config.hpp>
 #include <memory>
 #include <optional>
 #include <span>
@@ -14,25 +15,26 @@
 #include <type_traits>
 #include <vector>
 
-#include "src/core/model_config.hpp"
-#include "src/models/qwen/continuation_hooks.hpp"
+#include "src/families/qwen/hip_common/continuation_hooks.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/state.hpp"
-#include "src/models/qwen/tokenizer.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
-#include "src/core/hip/detail/hip_graph_decode_executor.hpp"
-#include "src/models/qwen/hip/execution_policy.hpp"
-#include "src/models/qwen/hip/ops/gemm.hpp"
-#include "src/models/qwen/hip/ops/ssm.hpp"
-#include "src/models/qwen/hip/ops/token.hpp"
+#include <gufo/ext/experimental/hip_graph_decode_executor.hpp>
+#include <gufo/ext/experimental/state_memory.hpp>
+
+#include "src/families/qwen/hip_common/execution_policy.hpp"
+#include "src/families/qwen/kernels/ops/gemm.hpp"
+#include "src/families/qwen/kernels/ops/ssm.hpp"
+#include "src/families/qwen/kernels/ops/token.hpp"
+#include "src/families/qwen/vision/device_input.hpp"
 #include "src/models/qwen/hip/prompt_hidden_buffer.hpp"
-#include "src/models/qwen/vision/device_input.hpp"
 
 namespace gufo::hip {
 
@@ -69,9 +71,9 @@ struct QwenGpuWeightRegion {
   void* device_data{nullptr};
   void* host_copy{nullptr};
   std::size_t size{0};
-  // Windows placement: device_data is a hipMalloc allocation uploaded from the
-  // mapping, and host_copy stays null. Mapped registration remains the Linux
-  // default; the loader probes support at runtime.
+  // Device placement, used whenever the heap has room: device_data is a
+  // hipMalloc allocation uploaded from the shard, and host_copy stays null.
+  // Mapped registration is the fallback when the heap is too small.
   bool owns_device_allocation{false};
 };
 
@@ -255,6 +257,12 @@ template<typename T>
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
 class QwenGpuArena {
 public:
+  /// Rows of one prompt pass, or the context when it is shorter.
+  static constexpr std::uint32_t kMaxPromptBatch = 4096;
+  /// K/V rows backed past the frontier: tile-rounded attention reads and
+  /// the next steps' writes.
+  static constexpr std::size_t kKvTileRows = 2048;
+
   explicit QwenGpuArena(
       const core::ModelConfig& config, std::uint32_t max_context = 4096,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
@@ -293,6 +301,11 @@ public:
                                             std::uint32_t position) const;
   [[nodiscard]] const float* GetReplayBeta(std::uint32_t layer,
                                            std::uint32_t position) const;
+  /// Grows the replay ring to hold `rows` rows of one pass (a power of two
+  /// slots). Call before the pass captures; returns true when buffers moved.
+  [[nodiscard]] bool EnsureSsmReplayCapacity(std::size_t rows);
+  [[nodiscard]] static std::size_t SsmReplayLogBytes(
+      const core::ModelConfig& config, std::size_t capacity);
 
   float* d_hidden{nullptr};
   float* d_normed{nullptr};
@@ -316,6 +329,8 @@ public:
   float* d_ssm_kq_scales{nullptr};
   float* d_ssm_alpha_beta{nullptr};
   float* d_logits{nullptr};
+  // K and V planes of [layer][position][width], one of the two per policy.
+  // Both point into kv_region_, backed as positions are written.
   void* d_attention_kv_f16{nullptr};
   float* d_kv_cache{nullptr};
   // Mirrors of the live recurrent buffers (see BeginRecurrentWrite); reassigned
@@ -340,6 +355,11 @@ public:
   [[nodiscard]] std::uint32_t GetMaxContext() const noexcept {
     return max_context_;
   }
+  /// Backs the K/V rows of positions below `end`, plus a tile of rows past
+  /// it, before they are written or read; maps further ahead on the page
+  /// pool's thread. Every writer calls it first, cache restores included.
+  /// Throws std::bad_alloc when no memory is left.
+  void EnsureKvRows(std::uint32_t end);
   [[nodiscard]] std::size_t GetAttentionKvPlaneElements() const noexcept {
     // Qwen27B reaches 2^32 elements per plane at context 262144.
     return static_cast<std::size_t>(config_.FullAttentionLayerCount()) *
@@ -354,6 +374,16 @@ public:
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
   [[nodiscard]] static std::size_t RecurrentStateBytes(
       const core::ModelConfig& config, QwenExecutionPolicy policy);
+  /// Attention K/V bytes at `max_context`: the demand-mapped part of
+  /// EstimateMemoryUsage().
+  [[nodiscard]] static std::size_t KvBytes(const core::ModelConfig& config,
+                                           std::uint32_t max_context,
+                                           QwenExecutionPolicy policy);
+  /// The account of this arena's K/V region (shared session state, #715).
+  [[nodiscard]] const std::shared_ptr<gufo::mem::StateAccount>& state_account()
+      const noexcept {
+    return account_;
+  }
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       std::uint32_t valid_context) const;
@@ -382,6 +412,8 @@ private:
   [[nodiscard]] bool AllocateSsmReplayLog();
 
   core::ModelConfig config_;
+  std::shared_ptr<gufo::mem::StateAccount> account_;
+  std::shared_ptr<gufo::mem::Region> kv_region_;
   std::uint32_t max_context_;
   std::uint32_t max_batch_;
   QwenExecutionPolicy policy_;
@@ -399,6 +431,7 @@ private:
   float* d_ssm_replay_alpha_{nullptr};
   float* d_ssm_replay_beta_{nullptr};
   std::uint32_t* d_ssm_replay_enabled_{nullptr};
+  std::size_t replay_capacity_{kSsmReplayCapacity};
   std::uint32_t saved_context_{0};
   std::uint32_t replay_last_position_{0};
   std::size_t replay_captured_positions_{0};
@@ -482,6 +515,12 @@ public:
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t start_pos = 0, bool compute_logits = true);
 
+  /// Rows one session may verify in a single pass. A chain longer than eight
+  /// rows (a prompt-lookup copy) shares every projection across its rows and
+  /// runs attention in eight-row segments, so each row has the arithmetic of
+  /// consecutive ordinary verifications; the replay ring grows to hold it.
+  static constexpr std::size_t kMaxWideVerificationRows = 64;
+
   /// Verifies a chunk of speculative draft candidate tokens in a single
   /// parallel prefill forward pass on the GPU.
   [[nodiscard]] std::vector<tokenization::TokenId> ForwardVerificationChunk(
@@ -560,11 +599,27 @@ public:
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const core::ModelConfig& config, std::uint32_t max_context,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+  [[nodiscard]] const std::shared_ptr<gufo::mem::StateAccount>& state_account()
+      const noexcept {
+    return arena_.state_account();
+  }
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
   void SetCancellationCheck(std::function<bool()> check) {
     cancellation_check_ = std::move(check);
     vision_input_.SetCancellationCheck(cancellation_check_);
   }
+  /// Splits the following prompt passes into at most `groups` layer groups
+  /// of about equal depth and calls `yield` between them, once the queued
+  /// layers have finished; other sessions may decode there on their own
+  /// executors. One group, or an empty `yield`, restores unsplit passes.
+  void SetPrefillYield(std::size_t groups, std::function<void()> yield);
+  /// Yields before the given ascending `layers` of each following prompt
+  /// pass instead; layer zero yields before the pass's first layer.
+  void SetPrefillYieldLayers(std::vector<std::uint32_t> layers,
+                             std::function<void()> yield);
+  /// Estimated milliseconds of one prompt pass of `rows` rows on gfx1151, for
+  /// spreading layer groups over passes of different widths.
+  [[nodiscard]] double PrefillPassCost(std::size_t rows) const;
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       std::uint32_t valid_context) const;
   void ConfigureVision(
@@ -598,6 +653,8 @@ private:
   void PrefillLayerCheckpoint(std::uint32_t layer);
   std::function<bool()> cancellation_check_;
   std::array<hipEvent_t, 2> prefill_events_{};
+  std::vector<std::uint32_t> yield_layers_;  ///< yield before these, ascending
+  std::function<void()> yield_;
   void CheckReset() const {
     if (reset_failure_)
       std::rethrow_exception(reset_failure_);

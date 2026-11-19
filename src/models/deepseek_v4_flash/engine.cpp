@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <gufo/ext/host.hpp>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -67,7 +68,20 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
 
-  return std::shared_ptr<Model>(new Model(engine, options));
+  std::shared_ptr<Model> model(new Model(engine, options));
+  // The renderer and the runtime tokenizer must agree on every control token.
+  for (std::size_t index = 0; index < kControlTokenCount; ++index) {
+    const auto spelling = ControlTokenText(static_cast<ControlToken>(index));
+    const auto tokens = model->Tokenize(spelling, true);
+    if (tokens.size() != 1) {
+      AssignError(error_msg,
+                  "DeepSeek V4 Flash tokenizer has no control token for " +
+                      std::string(spelling));
+      return nullptr;
+    }
+    model->control_tokens_[index] = tokens.front();
+  }
+  return model;
 }
 
 std::unique_ptr<Session> Model::CreateSession(core::SessionMode mode,
@@ -214,8 +228,20 @@ std::vector<int> Model::EncodeChat(std::span<const ChatMessage> messages,
 std::vector<int> Model::EncodeChat(std::span<const ChatMessage> messages,
                                    std::span<const ChatTool> tools,
                                    const ChatTemplateOptions& options) const {
-  const std::string rendered = RenderChat(messages, tools, options);
-  return Tokenize(rendered, true);
+  std::vector<ContentSpan> content_spans;
+  const std::string rendered =
+      RenderChat(messages, tools, options, &content_spans);
+  std::vector<int> tokens;
+  for (const auto& piece : SplitControlTokens(rendered, content_spans)) {
+    if (piece.control.has_value()) {
+      tokens.push_back(
+          control_tokens_[static_cast<std::size_t>(*piece.control)]);
+      continue;
+    }
+    const auto text = Tokenize(piece.text);
+    tokens.insert(tokens.end(), text.begin(), text.end());
+  }
+  return tokens;
 }
 
 std::string Model::DecodeToken(int token) const {
@@ -374,19 +400,23 @@ Session::DsparkStats Session::DsparkStatistics() const {
   return stats;
 }
 
-std::vector<float> Session::CopyLogits(std::string* error_msg) const {
+std::span<const float> Session::Logits(std::string* error_msg) const {
   const int vocab_size = model_->VocabSize();
   if (vocab_size <= 0) {
     AssignError(error_msg, "DeepSeek V4 Flash vocabulary size is invalid");
     return {};
   }
-  std::vector<float> logits(static_cast<std::size_t>(vocab_size));
-  if (ds4_session_copy_logits(session_, logits.data(), vocab_size) !=
-      vocab_size) {
-    AssignError(error_msg, "failed to copy DeepSeek V4 Flash logits");
+  const float* logits = ds4_session_logits(session_);
+  if (logits == nullptr) {
+    AssignError(error_msg, "DeepSeek V4 Flash logits are unavailable");
     return {};
   }
-  return logits;
+  return {logits, static_cast<std::size_t>(vocab_size)};
+}
+
+std::vector<float> Session::CopyLogits(std::string* error_msg) const {
+  const auto logits = Logits(error_msg);
+  return {logits.begin(), logits.end()};
 }
 
 std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
@@ -450,6 +480,22 @@ void Session::SetCancellationCheck(CancellationCheck is_cancelled) {
   ds4_session_set_cancel(session_, callback, this);
 }
 
+void Session::SetPrefillYield(std::size_t groups, std::function<void()> yield) {
+  prefill_yield_ = groups > 1 ? std::move(yield) : std::function<void()>{};
+  if (!prefill_yield_) {
+    ds4_session_set_prefill_yield(session_, 1, nullptr, nullptr);
+    return;
+  }
+  ds4_session_set_prefill_yield(
+      session_,
+      static_cast<std::uint32_t>(
+          std::min<std::size_t>(groups, std::numeric_limits<int>::max())),
+      +[](void* user_data) {
+        static_cast<const Session*>(user_data)->prefill_yield_();
+      },
+      this);
+}
+
 int Session::Position() const {
   return ds4_session_pos(session_);
 }
@@ -458,12 +504,71 @@ int Session::ContextSize() const {
   return ds4_session_ctx(session_);
 }
 
+std::uint32_t Session::PrefillCapacityFor(int context_size) {
+  return ds4_session_prefill_capacity_for(context_size);
+}
+
 std::uint32_t Session::PrefillCapacity() const {
   return ds4_session_prefill_capacity(session_);
 }
 
 std::uint64_t Session::PayloadBytes() const {
   return ds4_session_payload_bytes(session_);
+}
+
+std::shared_ptr<mem::StateAccount> Session::StateAccount() const {
+  return ds4_session_state_account(session_);
+}
+
+std::size_t Model::DemandMappedBytes(std::uint32_t max_context) const {
+  return ds4_engine_state_regions(engine_)
+             ? ds4_session_demand_mapped_bytes(static_cast<int>(max_context))
+             : 0;
+}
+
+bool Model::MeasureSessionState(core::SessionMode mode,
+                                std::uint32_t max_context,
+                                std::string* error_msg) {
+  // The first session may create the shared batch workspace; the second
+  // allocates only what every session does.
+  auto first = CreateSession(mode, max_context, error_msg);
+  if (!first)
+    return false;
+  auto second = CreateSession(mode, max_context, error_msg);
+  if (!second)
+    return false;
+  measured_context_ = max_context;
+  measured_fixed_bytes_ = ds4_session_fixed_bytes(second->session_);
+  const std::uint64_t workspace =
+      ds4_session_created_workspace(first->session_)
+          ? ds4_session_fixed_bytes(first->session_) -
+                std::min(ds4_session_fixed_bytes(first->session_),
+                         measured_fixed_bytes_)
+          : 0;
+  gufo::server::Logger::LogFormatted(
+      gufo::server::LogLevel::kInfo, "ds4",
+      "event=session_state context=%u fixed_bytes=%zu "
+      "demand_mapped_bytes=%zu workspace_bytes=%llu",
+      max_context, measured_fixed_bytes_, DemandMappedBytes(max_context),
+      (unsigned long long)workspace);
+  return true;
+}
+
+void Model::BuildWeightCopies() {
+  ds4_engine_build_weight_copies(engine_);
+}
+
+void Model::DisableStateRegions() {
+  ds4_engine_disable_state_regions(engine_);
+}
+
+std::optional<std::size_t> Model::SessionBytes(
+    std::uint32_t max_context) const {
+  if (measured_context_ != max_context || measured_context_ == 0 ||
+      !ds4_engine_state_regions(engine_))
+    return std::nullopt;
+  return ds4_session_demand_mapped_bytes(static_cast<int>(max_context)) +
+         measured_fixed_bytes_;
 }
 
 SessionSnapshot::SessionSnapshot(ds4_session_snapshot snapshot)

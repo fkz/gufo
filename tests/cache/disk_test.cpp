@@ -8,15 +8,19 @@
 #include <atomic>
 #include <cassert>
 #include <cerrno>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <new>
 
 using namespace gufo::cache;
 namespace fs = std::filesystem;
 namespace {
 std::atomic<std::uint64_t> actual_manifest_bytes{}, actual_payload_bytes{};
 std::atomic<bool> interrupt_next_read{}, shorten_reads{};
+thread_local std::int64_t fail_allocation_after{-1};
+thread_local std::int64_t validation_failure_after{-1};
 void CountRead(int fd, ssize_t bytes) {
   if (bytes <= 0)
     return;
@@ -33,6 +37,19 @@ void CountRead(int fd, ssize_t bytes) {
     actual_payload_bytes += bytes;
 }
 }  // namespace
+[[gnu::noinline]] void* operator new(std::size_t bytes) {
+  if (fail_allocation_after >= 0 && fail_allocation_after-- == 0)
+    throw std::bad_alloc();
+  if (auto* memory = std::malloc(bytes ? bytes : 1))
+    return memory;
+  throw std::bad_alloc();
+}
+[[gnu::noinline]] void operator delete(void* memory) noexcept {
+  std::free(memory);
+}
+[[gnu::noinline]] void operator delete(void* memory, std::size_t) noexcept {
+  std::free(memory);
+}
 extern "C" ssize_t __real_read(int, void*, size_t);
 extern "C" ssize_t __wrap_read(int fd, void* buffer, size_t size) {
   if (interrupt_next_read.exchange(false)) {
@@ -86,6 +103,13 @@ DiskManifest Manifest() {
                           {},
                           DiskPayload{Id(3), 16, 101}});
   return m;
+}
+std::size_t ManifestStorage(const DiskManifest& m) {
+  auto bytes = m.input.size() + m.tokens.size() * sizeof(Token) +
+               m.components.size() * sizeof(DiskComponent);
+  for (const auto& c : m.components)
+    bytes += c.chunks.size() * sizeof(DiskPayload);
+  return bytes;
 }
 void Write(const fs::path& p, std::span<const std::uint8_t> bytes) {
   std::ofstream f(p, std::ios::binary);
@@ -290,6 +314,7 @@ void Index() {
   Directory d;
   {
     DiskStore init(ledger, d.path, UINT64_MAX);
+    assert(init.OwnedManifestBytes() == 0);
   }
   auto m = Manifest();
   Payloads(d.path, m);
@@ -303,9 +328,17 @@ void Index() {
     assert(store.Entries()[0].Durable() &&
            !store.Entries()[0].PayloadVerified());
     assert(store.Stats().manifest_bytes_read == encoded_size);
+    assert(store.Stats().dependency_references == 3);
+    assert(store.Stats().distinct_dependency_files == 3);
     assert(store.Stats().dependency_stats == 3);
     assert(actual_manifest_bytes == encoded_size && actual_payload_bytes == 0);
     assert(store.Stats().managed_bytes == encoded_size + 28);
+    assert(store.OwnedManifestBytes() == ManifestStorage(m));
+    // Logical estimates and pending allocations do not establish owned bytes.
+    const auto pending = ledger.Reserve(ResourceCategory::kMetadata, 8192);
+    const auto estimated =
+        ledger.Reserve(ResourceCategory::kMetadata, 16384).Convert();
+    assert(store.OwnedManifestBytes() == ManifestStorage(m));
   }
   // Sparse files scale declared payload by 1 GiB, without increasing metadata
   // or startup reads. Their contents deliberately fail the declared CRCs.
@@ -324,6 +357,8 @@ void Index() {
   {
     DiskStore store(ledger, d.path, UINT64_MAX);
     assert(store.Entries().empty() && store.Stats().rejected_manifests == 1);
+    // The retained entry-table capacity and its charge are not manifest data.
+    assert(ledger.Snapshot().ram_bytes && store.OwnedManifestBytes() == 0);
   }
   Payloads(d.path, m);
   auto dependency = d.path / "v2/private" / DiskFileName(Id(3));
@@ -385,52 +420,235 @@ void Conflicts() {
     assert(store.Entries().empty());
   }
 }
-void Cleanup() {
-  Directory d, unrelated;
-  const std::array<std::uint8_t, 8> legacy{'G', 'U', 'F', 'O',
-                                           'K', 'V', 'C', '1'};
-  Write(d.path / "old.kvc", legacy);
-  fs::resize_file(d.path / "old.kvc", 1000000);
-  Write(d.path / ".tmp-owned", legacy);
-  Write(d.path / "unknown.kvc", std::array<std::uint8_t, 4>{1, 2, 3, 4});
-  Write(d.path / "unknown", legacy);
-  fs::create_directory(d.path / ".tmp-directory");
-  Write(d.path / ".tmp-directory/keep", legacy);
-  Write(unrelated.path / "old.kvc", legacy);
-  fs::create_directory_symlink(unrelated.path, d.path / "other");
-  fs::create_symlink(unrelated.path / "old.kvc", d.path / "link.kvc");
-  DiskStore store(ledger, d.path, 0);
-  assert(!fs::exists(d.path / "old.kvc") && !fs::exists(d.path / ".tmp-owned"));
-  assert(store.Stats().removed_legacy_bytes == 1000008);
-  assert(store.Stats().managed_bytes == 0);
-  for (const auto& p : {"unknown.kvc", "unknown", ".tmp-directory/keep",
-                        "other/old.kvc", "link.kvc"})
-    assert(fs::exists(d.path / p));
-}
-void InterruptedCleanup() {
-  Directory d;
-  const std::array<std::uint8_t, 4> legacy{'G', 'U', 'F', 'O'};
-  Write(d.path / "old.kvc", legacy);
-  fs::resize_file(d.path / "old.kvc", 1000000);
-  interrupt_next_read = true;
-  shorten_reads = true;
-  {
-    DiskStore store(ledger, d.path, 0);
-    assert(!fs::exists(d.path / "old.kvc"));
-    assert(store.Stats().removed_legacy_bytes == 1000000);
-    assert(store.Stats().legacy_probe_bytes_read == 4);
+void AllConflictOwners() {
+  // Three owners share a claim, including two agreeing owners and an outlier.
+  // Every side must be rejected, even if the outlier is visited first/last.
+  for (unsigned conflict = 0; conflict < 4; ++conflict) {
+    Directory d;
+    {
+      DiskStore init(ledger, d.path, UINT64_MAX);
+    }
+    std::array<DiskManifest, 4> manifests;
+    for (unsigned i = 0; i < manifests.size(); ++i) {
+      auto& m = manifests[i];
+      m = Manifest();
+      m.checkpoint = {7 + i};
+      m.components[0].tail->file = Id(20 + i);
+      m.components[1].private_state->file = Id(30 + i);
+      if (i == 3 || conflict >= 2)
+        m.components[0].chunks[0].file = Id(40 + i);
+    }
+    if (conflict == 0)
+      ++manifests[2].components[0].chunks[0].checksum;
+    if (conflict == 1)
+      ++manifests[2].compatibility[0];
+    if (conflict == 2)
+      for (unsigned i = 0; i < 3; ++i)
+        manifests[i].components[1].private_state->file = Id(30);
+    if (conflict == 3)
+      for (unsigned i = 0; i < 3; ++i)
+        manifests[i].checkpoint = {7};
+    for (const auto& m : manifests)
+      Payloads(d.path, m);
+    std::array<unsigned, 4> order{0, 1, 2, 3};
+    do {
+      // Reassign contents to filenames, exercising every enumeration order
+      // without relying on a particular filesystem's directory ordering.
+      for (unsigned i = 0; i < order.size(); ++i)
+        Put(d.path, manifests[order[i]], 100 + i);
+      actual_manifest_bytes = actual_payload_bytes = 0;
+      {
+        DiskStore store(ledger, d.path, UINT64_MAX);
+        assert(store.Entries().size() == 1);
+        assert(store.Entries().front().Manifest().checkpoint.value == 10);
+        assert(store.Stats().rejected_manifests == 3);
+        assert(actual_manifest_bytes && actual_payload_bytes == 0);
+      }
+      assert(ledger.Snapshot().total_bytes == 0);
+    } while (std::next_permutation(order.begin(), order.end()));
   }
-  shorten_reads = false;
+}
+void MissingDependenciesAndRestart() {
+  Directory d;
+  auto m = Manifest();
+  {
+    DiskStore init(ledger, d.path, UINT64_MAX);
+  }
+  Put(d.path, m);
+  for (unsigned failure = 0; failure < 3; ++failure) {
+    Payloads(d.path, m);
+    if (failure == 0)
+      fs::remove(d.path / "v2/chunks" / DiskFileName(Id(1)));
+    if (failure == 1)
+      fs::remove(d.path / "v2/private" / DiskFileName(Id(3)));
+    if (failure == 2)
+      fs::resize_file(d.path / "v2/private" / DiskFileName(Id(3)), 15);
+    {
+      DiskStore rejected(ledger, d.path, UINT64_MAX);
+      assert(rejected.Entries().empty());
+      assert(rejected.Stats().rejected_manifests == 1);
+    }
+    Payloads(d.path, m);
+    DiskStore restored(ledger, d.path, UINT64_MAX);
+    assert(restored.Entries().size() == 1);
+  }
+}
+void SharedDependencyRecovery() {
+  Directory d;
+  {
+    DiskStore init(ledger, d.path, UINT64_MAX);
+  }
+  const std::array<std::uint8_t, 8> bytes{1, 2, 3, 4, 5, 6, 7, 8};
+  std::array<DiskManifest, 3> owners;
+  for (unsigned i = 0; i < owners.size(); ++i) {
+    auto& m = owners[i];
+    m = Manifest();
+    m.checkpoint = {7 + i};
+    m.components[0].chunks[0].checksum = DiskChecksum(bytes);
+    m.components[0].tail->file = Id(10 + i);
+    // Equal IDs in the two namespaces name different dependencies, whose
+    // sizes also differ. A filename-only observation cache is incorrect.
+    m.components[1].private_state->file = Id(i ? 20 + i : 1);
+    Payloads(d.path, m);
+    Put(d.path, m, 100 + i);
+  }
+  const auto shared = d.path / "v2/chunks" / DiskFileName(Id(1));
+  const auto alias = d.path / "alias";
+  Write(shared, bytes);
+  const auto counts = [](const DiskStore& store) {
+    const auto stats = store.Stats();
+    assert(stats.dependency_references == 9);
+    assert(stats.distinct_dependency_files == 7);
+    assert(stats.dependency_stats == 7);
+  };
+  for (unsigned failure = 0; failure < 5; ++failure) {
+    // Each recovery gets fresh metadata; observations must not persist across
+    // stores. Every owner of the unavailable shared dependency is rejected.
+    if (failure == 0)
+      fs::remove(shared);
+    if (failure == 1)
+      fs::resize_file(shared, bytes.size() - 1);
+    if (failure == 2) {
+      fs::remove(shared);
+      Write(alias, bytes);
+      fs::create_symlink(alias, shared);
+    }
+    if (failure == 3)
+      fs::create_hard_link(shared, alias);
+    if (failure == 4) {
+      fs::remove(shared);
+      fs::create_directory(shared);
+    }
+    actual_manifest_bytes = actual_payload_bytes = 0;
+    {
+      DiskStore rejected(ledger, d.path, UINT64_MAX);
+      counts(rejected);
+      assert(rejected.Entries().empty());
+      assert(rejected.Stats().rejected_manifests == owners.size());
+      assert(actual_manifest_bytes && actual_payload_bytes == 0);
+    }
+    fs::remove(shared);
+    fs::remove(alias);
+    Write(shared, bytes);
+    actual_manifest_bytes = actual_payload_bytes = 0;
+    {
+      DiskStore restored(ledger, d.path, UINT64_MAX);
+      counts(restored);
+      assert(restored.Entries().size() == owners.size());
+      assert(restored.Stats().rejected_manifests == 0);
+      assert(actual_manifest_bytes && actual_payload_bytes == 0);
+      const auto snapshot = restored.Open({7});
+      assert(snapshot);
+      std::array<std::uint8_t, 3> staging{};
+      std::size_t copied{};
+      const auto read = restored.ReadPayload(
+          *snapshot, false, owners[0].components[0].chunks[0], staging,
+          [&](auto offset, auto piece) {
+            assert(offset == copied &&
+                   std::ranges::equal(
+                       piece, std::span(bytes).subspan(offset, piece.size())));
+            copied += piece.size();
+          });
+      assert(copied == bytes.size() && read.bytes == bytes.size() &&
+             !read.verification_cached);
+    }
+    assert(ledger.Snapshot().total_bytes == 0);
+  }
+  // Startup metadata reuse never attests payload contents. A same-size
+  // mutation after recovery must still fail the first restore checksum.
+  {
+    DiskStore store(ledger, d.path, UINT64_MAX);
+    const auto snapshot = store.Open({7});
+    assert(snapshot);
+    auto corrupt = bytes;
+    corrupt[0] ^= 1;
+    Write(shared, corrupt);
+    std::array<std::uint8_t, 3> staging{};
+    bool invalid = false;
+    try {
+      (void)store.ReadPayload(*snapshot, false,
+                              owners[0].components[0].chunks[0], staging,
+                              [](auto, auto) {});
+    } catch (const DiskDependencyError& error) {
+      invalid = !error.private_file && error.file == Id(1);
+    }
+    assert(invalid);
+  }
+  assert(ledger.Snapshot().total_bytes == 0);
+}
+void UnavailableOwnersDoNotConflict() {
+  // Availability filtering precedes both canonical-reference validation and
+  // duplicate checkpoint IDs. An unavailable owner's claims cannot poison a
+  // compatible available owner, regardless of filesystem enumeration order.
+  for (unsigned failure = 0; failure < 2; ++failure) {
+    Directory d;
+    {
+      DiskStore init(ledger, d.path, UINT64_MAX);
+    }
+    auto good = Manifest(), bad = good;
+    bad.components[0].tail->file = Id(12);
+    bad.components[1].private_state->file = Id(13);
+    ++bad.components[0].chunks[0].checksum;
+    if (failure == 0) {
+      // Both references are individually well formed, but only the good
+      // owner's size matches the observed file. Cache actual size, not the
+      // outcome of checking the first reference encountered.
+      bad.components[0].descriptor.row_bytes *= 2;
+      bad.components[0].chunks[0].bytes *= 2;
+      bad.components[0].tail->bytes *= 2;
+    }
+    Payloads(d.path, bad);
+    Payloads(d.path, good);
+    if (failure == 1)
+      fs::remove(d.path / "v2/private" / DiskFileName(Id(13)));
+    for (bool reverse : {false, true}) {
+      Put(d.path, reverse ? bad : good, 100);
+      Put(d.path, reverse ? good : bad, 101);
+      actual_manifest_bytes = actual_payload_bytes = 0;
+      {
+        DiskStore store(ledger, d.path, UINT64_MAX);
+        const auto stats = store.Stats();
+        assert(stats.dependency_references == 6);
+        assert(stats.distinct_dependency_files == 5);
+        assert(stats.dependency_stats == 5);
+        assert(stats.rejected_manifests == 1);
+        assert(store.Entries().size() == 1);
+        assert(EncodeManifest(store.Entries()[0].Manifest()) ==
+               EncodeManifest(good));
+        assert(actual_manifest_bytes && actual_payload_bytes == 0);
+      }
+      assert(ledger.Snapshot().total_bytes == 0);
+    }
+  }
 }
 void RootSymlinks() {
   Directory d, target;
-  Write(target.path / "old.kvc",
-        std::array<std::uint8_t, 4>{'G', 'U', 'F', 'O'});
+  Write(target.path / "file", std::array<std::uint8_t, 4>{1, 2, 3, 4});
   auto link = d.path / "alias";
   fs::create_directory_symlink(target.path, link);
   for (const auto& suffix : {"", "/", "/.", "/./"}) {
     Reject([&] { DiskStore store(ledger, link.string() + suffix, 0); });
-    assert(fs::exists(target.path / "old.kvc"));
+    assert(fs::exists(target.path / "file"));
     assert(!fs::exists(target.path / "LOCK"));
   }
 }
@@ -438,14 +656,9 @@ void ParentPathResolution() {
   Directory base, target;
   fs::create_directory(target.path / "sub");
   fs::create_directory_symlink(target.path / "sub", base.path / "alias");
-  const std::array<std::uint8_t, 4> legacy{'G', 'U', 'F', 'O'};
-  Write(base.path / "old.kvc", legacy);
-  Write(target.path / "old.kvc", legacy);
   {
     DiskStore store(ledger, base.path / "alias/..", 0);
-    assert(!fs::exists(target.path / "old.kvc"));
     assert(fs::exists(target.path / "LOCK"));
-    assert(fs::exists(base.path / "old.kvc"));
     assert(!fs::exists(base.path / "LOCK"));
   }
 }
@@ -498,6 +711,36 @@ void MetadataAdmission() {
     }
     assert(succeeded);
   }
+  // Walk actual recovery-validation allocations, including ledger tokens,
+  // nodes, arrays and dependency StatAt pathname storage. StatAt reports OOM
+  // through its no-throw boundary; recovery must abort without rejecting valid
+  // owners. Other startup filesystem wrappers remain outside this scope.
+  // Whole-construction ledger faults remain covered above.
+  DiskStore::SetReferenceValidationHook([](bool entering) noexcept {
+    fail_allocation_after = entering ? validation_failure_after : -1;
+  });
+  bool allocated = false;
+  for (std::int64_t n = 0; n < 512; ++n) {
+    ResourceLedger faults{{1 << 20, 1 << 20, 0, 0}};
+    validation_failure_after = n;
+    try {
+      DiskStore store(faults, d.path, UINT64_MAX);
+      assert(store.Entries().size() == 1);
+      allocated = true;
+    } catch (const std::bad_alloc&) {
+    }
+    assert(fail_allocation_after == -1);
+    validation_failure_after = -1;
+    assert(faults.Snapshot().total_bytes == 0);
+    {
+      DiskStore reopened(ledger, d.path, UINT64_MAX);
+      assert(reopened.Entries().size() == 1);
+    }
+    if (allocated)
+      break;
+  }
+  DiskStore::SetReferenceValidationHook(nullptr);
+  assert(allocated);
   // Structurally rejected entries retain no decoded-vector charge.
   fs::resize_file(d.path / "v2/chunks" / DiskFileName(Id(1)), 7);
   {
@@ -556,6 +799,118 @@ void BudgetAndDirectories() {
   fs::create_directory_symlink(unrelated.path, d.path / "v2/private");
   Reject([&] { DiskStore store(ledger, d.path, UINT64_MAX); });
   assert(fs::is_empty(unrelated.path));
+}
+void ManagedUsageRequiresPayloadMetadata() {
+  const std::array<std::uint8_t, 8> chunk{1, 2, 3, 4};
+  const std::array<std::uint8_t, 4> tail{5, 6};
+  const std::array<std::uint8_t, 16> state{7, 8, 9};
+  auto first = Manifest();
+  first.components[0].chunks[0].checksum = DiskChecksum(chunk);
+  first.components[0].tail->checksum = DiskChecksum(tail);
+  first.components[1].private_state->checksum = DiskChecksum(state);
+  const std::array<DiskWriteBuffer, 3> initial{
+      {{false, Id(1), chunk}, {true, Id(2), tail}, {true, Id(3), state}}};
+  const auto first_bytes =
+      EncodeManifest(first).size() + chunk.size() + tail.size() + state.size();
+  {
+    Directory directory;
+    auto next = first;
+    next.checkpoint = {8};
+    next.components[0].tail->file = Id(12);
+    next.components[1].private_state->file = Id(13);
+    const std::array<DiskWriteBuffer, 2> additional{
+        {{true, Id(12), tail}, {true, Id(13), state}}};
+    // Exactly enough for both manifests and their distinct referenced files.
+    // A manifest-only sum cannot account for unrelated orphan/temp storage.
+    const auto budget =
+        first_bytes + EncodeManifest(next).size() + tail.size() + state.size();
+    {
+      DiskStore store(ledger, directory.path, budget);
+      store.Publish(Id(7), first, initial);
+      assert(store.Stats().managed_bytes == first_bytes);
+    }
+    constexpr std::size_t kOrphanBytes = 64 << 10, kTemporaryBytes = 17;
+    const auto orphan = directory.path / "v2/chunks" / DiskFileName(Id(90));
+    const auto temporary = directory.path / "v2/tmp" / DiskFileName(Id(91));
+    Write(orphan, {});
+    fs::resize_file(orphan, kOrphanBytes);
+    Write(temporary, {});
+    fs::resize_file(temporary, kTemporaryBytes);
+    actual_manifest_bytes = actual_payload_bytes = 0;
+    {
+      DiskStore store(ledger, directory.path, budget);
+      assert(store.Entries().size() == 1);
+      assert(store.Stats().managed_bytes ==
+             first_bytes + kOrphanBytes + kTemporaryBytes);
+      assert(store.Stats().dependency_stats == 3);
+      assert(actual_manifest_bytes == EncodeManifest(first).size());
+      assert(actual_payload_bytes == 0);
+      bool exhausted = false;
+      try {
+        store.Publish(Id(8), next, additional);
+      } catch (const DiskCapacityExhausted&) {
+        exhausted = true;
+      }
+      assert(exhausted && actual_payload_bytes == 0);
+      assert(store.Entries().size() == 1 && !store.Open({8}));
+      store.ReclaimOrphans();
+      store.WaitForReclamation();
+      assert(!fs::exists(orphan) && !fs::exists(temporary));
+      assert(store.Stats().managed_bytes == first_bytes);
+      store.Publish(Id(8), next, additional);
+      assert(store.Stats().managed_bytes == budget);
+      assert(store.Entries().size() == 2);
+    }
+    {
+      DiskStore reopened(ledger, directory.path, budget);
+      assert(reopened.Stats().managed_bytes == budget);
+      assert(reopened.Entries().size() == 2);
+      const auto snapshot = reopened.Open(next.checkpoint);
+      assert(snapshot);
+      const auto read = [&](bool private_file, const DiskPayload& payload,
+                            std::span<const std::uint8_t> expected) {
+        std::array<std::uint8_t, 5> staging{};
+        std::size_t copied{};
+        const auto result = reopened.ReadPayload(
+            *snapshot, private_file, payload, staging,
+            [&](auto offset, auto bytes) {
+              assert(offset == copied &&
+                     std::ranges::equal(
+                         bytes, expected.subspan(offset, bytes.size())));
+              copied += bytes.size();
+            });
+        assert(copied == expected.size() && result.bytes == expected.size());
+      };
+      read(false, next.components[0].chunks[0], chunk);
+      read(true, *next.components[0].tail, tail);
+      read(true, *next.components[1].private_state, state);
+    }
+  }
+  assert(ledger.Snapshot().total_bytes == 0);
+  {
+    Directory directory;
+    {
+      DiskStore store(ledger, directory.path, UINT64_MAX);
+      store.Publish(Id(7), first, initial);
+    }
+    const auto chunks = directory.path / "v2/chunks";
+    const auto directory_mtime = fs::last_write_time(chunks);
+    // No namespace change: a persisted directory timestamp or manifest size
+    // sum cannot attest the current managed bytes of an existing payload.
+    constexpr std::size_t kGrownBytes = 64 << 10;
+    fs::resize_file(chunks / DiskFileName(Id(1)), kGrownBytes);
+    assert(fs::last_write_time(chunks) == directory_mtime);
+    actual_manifest_bytes = actual_payload_bytes = 0;
+    DiskStore recovered(ledger, directory.path, UINT64_MAX);
+    assert(recovered.Stats().managed_bytes ==
+           first_bytes - chunk.size() + kGrownBytes);
+    assert(recovered.Stats().dependency_stats == 3);
+    assert(recovered.Stats().rejected_manifests == 1);
+    assert(recovered.Entries().empty() && !recovered.Open(first.checkpoint));
+    assert(actual_manifest_bytes == EncodeManifest(first).size());
+    assert(actual_payload_bytes == 0);
+  }
+  assert(ledger.Snapshot().total_bytes == 0);
 }
 void CapacityBeforePayloadReads() {
   Directory directory;
@@ -701,6 +1056,151 @@ void VerifiedDependencies() {
   assert(retire() == settled);
 }
 }  // namespace
+// A window manifest lists the chunks from its window's first row, uses the
+// window format version and size, and shares chunk files with other
+// manifests at different list positions. Window 3 rows, chunks of 2.
+DiskManifest Windowed(Rows rows, std::vector<unsigned> chunks, unsigned tail,
+                      unsigned checkpoint) {
+  DiskManifest m;
+  m.checkpoint = {checkpoint};
+  m.lineage = {3};
+  m.compatibility.fill(0x42);
+  m.tokens.assign(rows, 17);
+  DiskComponent window{{{1}, 4, ComponentKind::kWindowRows, 4, 2, 0, 3},
+                       {{1}, rows},
+                       {},
+                       {},
+                       {}};
+  for (auto id : chunks)
+    window.chunks.push_back({Id(id), 8, 90 + id});
+  if (tail)
+    window.tail = DiskPayload{Id(tail), 4, 90 + tail};
+  m.components.push_back(window);
+  m.components.push_back({{{2}, 5, ComponentKind::kPrivateState, 0, 0, 16},
+                          {{2}, rows},
+                          {},
+                          {},
+                          DiskPayload{Id(100 + checkpoint), 16, 101}});
+  return m;
+}
+void WindowFormat() {
+  const auto eight = Windowed(8, {1, 2}, 0, 7);  // Chunks [4, 6) and [6, 8).
+  auto encoded = EncodeManifest(eight);
+  assert(encoded[8] == kDiskWindowFormatVersion);
+  auto decoded = DecodeManifest(encoded);
+  assert(decoded.components[0].descriptor.window_rows == 3);
+  assert(decoded.components[0].chunks == eight.components[0].chunks);
+  assert(EncodeManifest(decoded) == encoded);
+  for (std::size_t i = 0; i < encoded.size(); ++i)
+    Reject([&] { (void)DecodeManifest(std::span(encoded).first(i)); });
+  // Window components need the window format version.
+  auto old = encoded;
+  old[8] = kDiskFormatVersion;
+  const auto checksum = DiskChecksum(std::span(old).first(old.size() - 8));
+  for (unsigned i = 0; i < 8; ++i)
+    old[old.size() - 8 + i] = (checksum >> (8 * i)) & 255;
+  Reject([&] { (void)DecodeManifest(old); });
+  // Chunks start at the window's first chunk, never at row 0.
+  Reject([&] { (void)EncodeManifest(Windowed(8, {1}, 0, 7)); });
+  Reject([&] { (void)EncodeManifest(Windowed(8, {9, 1, 2}, 0, 7)); });
+  auto unsized = eight;
+  unsized.components[0].descriptor.window_rows = 0;
+  Reject([&] { (void)EncodeManifest(unsized); });
+  // Chunk [6, 8) is second in one manifest and first in the other.
+  Directory d;
+  {
+    DiskStore init(ledger, d.path, UINT64_MAX);
+  }
+  const auto nine = Windowed(9, {2}, 3, 8);  // Chunk [6, 8) and row 8.
+  for (const auto* m : {&eight, &nine})
+    Payloads(d.path, *m);
+  Put(d.path, eight, 7);
+  Put(d.path, nine, 8);
+  {
+    DiskStore store(ledger, d.path, UINT64_MAX);
+    assert(store.Entries().size() == 2);
+    assert(store.Stats().rejected_manifests == 0);
+  }
+}
+// Publication validates its candidate against stored checkpoints. That check
+// must not need RAM-ledger headroom proportional to every reference on disk:
+// the RAM cache fills the same ledger, and a refusal there stopped all disk
+// publication permanently once the tier had grown (#1030).
+void ValidationIndependentOfStoredReferences() {
+  Directory d;
+  {
+    DiskStore init(ledger, d.path, UINT64_MAX);
+  }
+  constexpr unsigned kStored = 2, kRows = 16384;
+  const std::array<std::uint8_t, 1> byte{0};
+  const auto checksum = DiskChecksum(byte);
+  const auto file = [](unsigned manifest, unsigned row) {
+    auto id = Id(row);
+    id[2] = manifest + 1;
+    return id;
+  };
+  const auto rows = [&](unsigned manifest, unsigned count) {
+    DiskManifest m;
+    m.checkpoint = {100 + manifest};
+    m.lineage = {3};
+    m.compatibility.fill(0x42);
+    m.tokens = {17, 18, 19};
+    DiskComponent c{{{1}, 4, ComponentKind::kAppendRows, 1, 1, 0},
+                    {{1}, count},
+                    {},
+                    {},
+                    {}};
+    for (unsigned row = 0; row < count; ++row)
+      c.chunks.push_back({file(manifest, row), 1, checksum});
+    m.components.push_back(std::move(c));
+    return m;
+  };
+  for (unsigned i = 0; i < kStored; ++i) {
+    auto m = rows(i, kRows);
+    Payloads(d.path, m);
+    Put(d.path, m, 1000 + i);
+  }
+  // Ample for publishing one small checkpoint, far below a catalog of all
+  // kStored * kRows stored references.
+  constexpr std::size_t kHeadroom = 1 << 20;
+  ResourceLedger full{{1ULL << 32, 1ULL << 32, 0, 0}};
+  {
+    DiskStore store(full, d.path, UINT64_MAX);
+    assert(store.Entries().size() == kStored);
+    const auto used = full.Snapshot().ram_bytes;
+    // Stand-in for a RAM cache that already occupies the rest of the budget.
+    auto cache = full.Reserve(ResourceCategory::kMetadata,
+                              (1ULL << 32) - used - kHeadroom);
+    auto candidate = rows(kStored, 1);
+    const std::array<DiskWriteBuffer, 1> buffers{
+        {{false, file(kStored, 0), byte}}};
+    store.Publish(Id(2000), candidate, buffers);
+    assert(store.Open(candidate.checkpoint));
+    // The candidate is still checked against every stored checkpoint.
+    auto conflict = rows(kStored + 1, 1);
+    // Same bytes, so verification passes; a different lineage cannot share.
+    conflict.lineage = {4};
+    conflict.components[0].chunks[0].file = file(0, 0);
+    bool invalid = false;
+    try {
+      store.Publish(Id(2001), conflict, {});
+    } catch (const std::invalid_argument&) {
+      invalid = true;
+    }
+    assert(invalid && !store.Open(conflict.checkpoint));
+    auto duplicate = rows(kStored + 2, 1);
+    duplicate.checkpoint = {100};
+    duplicate.components[0].chunks[0].file = file(0, 0);
+    invalid = false;
+    try {
+      store.Publish(Id(2002), duplicate, {});
+    } catch (const std::invalid_argument&) {
+      invalid = true;
+    }
+    assert(invalid);
+  }
+  assert(full.Snapshot().total_bytes == 0);
+}
 int main() {
   Format();
   ChecksumReference();
@@ -708,14 +1208,19 @@ int main() {
   Ownership();
   Index();
   Conflicts();
-  Cleanup();
+  AllConflictOwners();
+  MissingDependenciesAndRestart();
+  SharedDependencyRecovery();
+  UnavailableOwnersDoNotConflict();
   BudgetAndDirectories();
+  ManagedUsageRequiresPayloadMetadata();
   CapacityBeforePayloadReads();
   VerifiedDependencies();
-  InterruptedCleanup();
   RootSymlinks();
   ParentPathResolution();
   MetadataAdmission();
+  ValidationIndependentOfStoredReferences();
+  WindowFormat();
   assert(ledger.Snapshot().total_bytes == 0);
   std::cout << "disk format, ownership and metadata index passed\n";
 }

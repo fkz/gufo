@@ -19,8 +19,8 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/platform/mapped_file.hpp"
-#include "src/core/platform/os_info.hpp"
+#include <gufo/ext/platform/mapped_file.hpp>
+#include <gufo/ext/platform/os_info.hpp>
 #include "src/models/minimax_h3/denoiser.hpp"
 #include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/dit_ops.hip.hpp"
@@ -343,9 +343,16 @@ public:
     }
     if (Execute(weight, input, output, batch, rows, columns) !=
         rocblas_status_success) {
-      SetError(error,
-               "pinned gfx1151 MiniMax H3 BF16 GEMM solution is unavailable");
-      return false;
+      // Solution indices belong to a rocBLAS database, not to a matrix
+      // shape. Validate the current library's default when that database
+      // no longer contains the pinned index (as the DiT GEMM does).
+      solution_index_ = 0;
+      if (Execute(weight, input, output, batch, rows, columns) !=
+          rocblas_status_success) {
+        SetError(error,
+                 "pinned gfx1151 MiniMax H3 BF16 GEMM solution is unavailable");
+        return false;
+      }
     }
     hipError_t status =
         hipMemcpyAsync(reference->data(), output, reference->bytes(),
@@ -448,11 +455,12 @@ private:
         output, rocblas_datatype_bf16_r, static_cast<rocblas_int>(rows), output,
         rocblas_datatype_bf16_r, static_cast<rocblas_int>(rows),
         rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index,
-        kGfx1151RocblasBf16Solution, 0);
+        solution_index_, 0);
   }
 
   rocblas_handle handle_{nullptr};
   std::vector<Plan> plans_;
+  rocblas_int solution_index_{kGfx1151RocblasBf16Solution};
 };
 
 class F32Gemm {
@@ -600,6 +608,7 @@ struct DenoiserSession::Impl {
   std::vector<std::uint16_t> final_modulation_host;
   std::vector<float> video_rows_host;
   std::vector<float> audio_rows_host;
+  std::vector<float> condition_rows_host;
   std::vector<std::unique_ptr<DitBlockSession>> blocks;
   std::vector<double> forward_history;
 
@@ -622,6 +631,7 @@ struct DenoiserSession::Impl {
 
   DeviceBuffer video_sample;
   DeviceBuffer audio_sample;
+  DeviceBuffer condition_sample;
   DeviceBuffer projection_scratch_f32;
   DeviceBuffer hidden_device;
   DeviceBuffer block_row_map;
@@ -939,6 +949,12 @@ struct DenoiserSession::Impl {
       const std::size_t index = static_cast<std::size_t>(step);
       times[time_rows.video_rows[index]] = 1.0F - schedule.video[index];
       times[time_rows.audio_rows[index]] = 1.0F - schedule.audio[index];
+    }
+    for (std::size_t index = 0; index < time_rows.condition_rows.size();
+         ++index) {
+      times[time_rows.condition_rows[index]] =
+          std::max(1.0F - schedule.video[index],
+                   kH3KeyframeConditionTimestep);
     }
     std::vector<float> features(time_rows.time_rows * kTimeInputWidth);
     for (std::size_t row = 0; row < time_rows.time_rows; ++row) {
@@ -1430,6 +1446,8 @@ struct DenoiserSession::Impl {
         static_cast<std::size_t>(geometry.temporal.audio_latent_frames);
     const std::size_t video_rows = layout.video_target_rows;
     const std::size_t audio_rows = layout.audio_target_rows;
+    const std::size_t condition_elements =
+        layout.video_condition_rows * kH3VideoPatchWidth;
     const std::size_t hidden_elements = layout.rows() * kDitHiddenSize;
     const std::size_t maximum_projection_rows =
         std::max(video_rows, audio_rows);
@@ -1438,6 +1456,9 @@ struct DenoiserSession::Impl {
     };
     if (!video_sample.Allocate(video_elements * sizeof(float), error) ||
         !audio_sample.Allocate(audio_elements * sizeof(float), error) ||
+        (condition_elements != 0 &&
+         !condition_sample.Allocate(condition_elements * sizeof(float),
+                                    error)) ||
         !projection_scratch_f32.Allocate(
             maximum_projection_rows * kDitHiddenSize * sizeof(float), error) ||
         !hidden_device.Allocate(bf16(hidden_elements), error) ||
@@ -1454,9 +1475,10 @@ struct DenoiserSession::Impl {
     audio_rows_host.resize(audio_elements);
     forward_history.reserve(static_cast<std::size_t>(schedule.evaluations()) +
                             16U);
-    const std::array<const DeviceBuffer*, 9> buffers = {
+    const std::array<const DeviceBuffer*, 10> buffers = {
         &video_sample,
         &audio_sample,
+        &condition_sample,
         &projection_scratch_f32,
         &hidden_device,
         &block_row_map,
@@ -1509,6 +1531,27 @@ struct DenoiserSession::Impl {
     return true;
   }
 
+  // Anchor rows are frozen for the whole Euler trajectory (the reference
+  // writes them once before the loop; updates touch generated rows only),
+  // so they upload once at session creation and never see another copy.
+  bool UploadConditionRows(std::string* error) {
+    if (condition_rows_host.empty()) {
+      return true;
+    }
+    if (!CopyAsync(condition_sample.data(), condition_rows_host.data(),
+                   condition_rows_host.size() * sizeof(float),
+                   hipMemcpyHostToDevice, "copy H3 keyframe anchor rows",
+                   error)) {
+      return false;
+    }
+    const hipError_t status = hipStreamSynchronize(stream);
+    if (status != hipSuccess) {
+      SetError(error, HipError("synchronize H3 anchor upload", status));
+      return false;
+    }
+    return true;
+  }
+
   bool ForwardDevice(int step, const CancellationToken* cancellation,
                      bool read_velocity, DenoiserVelocity* velocity,
                      std::string* error) {
@@ -1521,9 +1564,12 @@ struct DenoiserSession::Impl {
       return false;
     }
     const auto begin = Clock::now();
-    const std::size_t audio_offset = layout.text_rows * kDitHiddenSize;
+    const std::size_t condition_offset = layout.text_rows * kDitHiddenSize;
+    const std::size_t audio_offset =
+        (layout.text_rows + layout.video_condition_rows) * kDitHiddenSize;
     const std::size_t video_offset =
-        (layout.text_rows + layout.audio_target_rows) * kDitHiddenSize;
+        (layout.text_rows + layout.video_condition_rows +
+         layout.audio_target_rows) * kDitHiddenSize;
     // Compose the token sequence directly in its first trunk input buffer.
     // Separate projected-token allocations and D2D copies serve no purpose.
     if (!projection_gemm.Run(
@@ -1548,6 +1594,22 @@ struct DenoiserSession::Impl {
         hidden_device.As<std::uint16_t>() + audio_offset,
         static_cast<std::uint32_t>(layout.audio_target_rows), kDitHiddenSize,
         stream);
+    if (layout.video_condition_rows != 0) {
+      // Anchors share the generated-video projection (reference proj_in over
+      // the leading conditioned rows) but never receive velocity updates.
+      if (!projection_gemm.Run(
+              video_patch_weight.As<float>(), condition_sample.As<float>(),
+              projection_scratch_f32.As<float>(),
+              layout.video_condition_rows, kDitHiddenSize,
+              kH3VideoPatchWidth, stream, error)) {
+        return false;
+      }
+      dit_ops::LaunchAddBiasF32ToBf16(
+          projection_scratch_f32.As<float>(), video_patch_bias.As<float>(),
+          hidden_device.As<std::uint16_t>() + condition_offset,
+          static_cast<std::uint32_t>(layout.video_condition_rows),
+          kDitHiddenSize, stream);
+    }
     const std::size_t text_bytes =
         refined_text_host.size() * sizeof(std::uint16_t);
     if (!CheckLaunch("H3 patch projections", error) ||
@@ -1687,16 +1749,32 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
           options.text_rows * kH3TextConditionWidth ||
       (!conditioning.tags.empty() &&
        conditioning.tags.size() != options.text_rows) ||
+      (!conditioning.anchor_temporal.empty()) !=
+          (options.condition_video_rows != 0) ||
+      conditioning.condition_rows.size() !=
+          options.condition_video_rows * kH3VideoPatchWidth ||
       IsCancelled(cancellation)) {
     SetError(error, "invalid MiniMax H3 denoiser creation arguments");
     return nullptr;
   }
-  auto layout = BuildTextOnlyLayout(options.text_rows, options.geometry, error);
+  const bool conditioned = !conditioning.anchor_temporal.empty();
+  auto layout =
+      conditioned ? BuildKeyframeLayout(options.text_rows, options.geometry,
+                                        conditioning.anchor_temporal, error)
+                  : BuildTextOnlyLayout(options.text_rows, options.geometry,
+                                        error);
   auto schedule = BuildServingSchedule(options.evaluations, error);
   if (!layout || !schedule) {
     return nullptr;
   }
-  auto time_rows = BuildTimeRowSchedule(*schedule, error);
+  if (conditioned &&
+      layout->video_condition_rows != options.condition_video_rows) {
+    SetError(error, "MiniMax H3 anchor rows differ from the packed layout");
+    return nullptr;
+  }
+  auto time_rows = conditioned
+                       ? BuildConditionedTimeRowSchedule(*schedule, error)
+                       : BuildTimeRowSchedule(*schedule, error);
   if (!time_rows) {
     return nullptr;
   }
@@ -1719,6 +1797,8 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   if (impl->text_tags.empty()) {
     impl->text_tags.assign(options.text_rows, 1);
   }
+  impl->condition_rows_host.assign(conditioning.condition_rows.begin(),
+                                   conditioning.condition_rows.end());
   impl->row_maps.reserve(static_cast<std::size_t>(options.evaluations));
   for (int step = 0; step < options.evaluations; ++step) {
     auto rows = BuildModulationRowMap(impl->time_rows, step, impl->layout,
@@ -1743,7 +1823,8 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   }
   if (!impl->RefineText(conditioning.layer50, cancellation, error) ||
       !impl->BuildBlocks(cancellation, error) ||
-      !impl->LoadHeads(cancellation, error) || !impl->AllocateIo(error)) {
+      !impl->LoadHeads(cancellation, error) || !impl->AllocateIo(error) ||
+      !impl->UploadConditionRows(error)) {
     return nullptr;
   }
   // Text refinement and modulation precomputation are complete. Inference

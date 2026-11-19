@@ -1,0 +1,93 @@
+#pragma once
+
+#include <cstdint>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "gufo/ext/asr.hpp"
+#include "gufo/ext/decision.hpp"
+#include "gufo/ext/embeddings.hpp"
+#include "gufo/ext/image.hpp"
+#include "gufo/ext/options.hpp"
+#include "gufo/ext/text.hpp"
+#include "gufo/ext/tts.hpp"
+#include "gufo/ext/video.hpp"
+
+namespace gufo::ext {
+// Adding a capability requires a core contract. Extensions cannot invent kinds.
+enum class Capability {
+  kTextGeneration,
+  kEmbeddings,
+  kSpeechRecognition,
+  kSpeechSynthesis,
+  kImageGeneration,
+  kVideoGeneration,
+  kDecision,
+};
+struct ExtensionInfo {
+  std::string name;
+  std::string version;
+  std::string source;
+  /// Where an external extension's source came from: the commit of its Git
+  /// work tree, else the revision the build declared for its directory, else
+  /// "unknown". Empty for an in-tree extension and for a module.
+  std::string revision = {};
+  /// Whether that work tree had uncommitted changes when the build was
+  /// configured.
+  bool dirty = false;
+};
+struct ExcludedExtension {
+  ExtensionInfo extension;
+  std::vector<std::string> keys;
+  std::vector<std::string> model_ids;
+  std::vector<std::string> options;
+  std::string reason;
+};
+struct ProviderInfo {
+  std::string id;
+  Capability capability = Capability::kTextGeneration;
+  std::vector<std::string> keys;
+  std::vector<std::string> model_ids;
+  std::vector<std::string> speculative;
+  std::vector<OptionSpec> options;
+  bool available = true;
+  std::string unavailable_reason;
+  std::string extension;
+  /// Hardware queues the provider asks a server to cap the HIP runtime at,
+  /// from `serving.hardware_queues` in its metadata. Zero keeps the
+  /// modality's default. The server still clamps it to the device budget, and
+  /// an operator's GPU_MAX_HW_QUEUES always wins.
+  std::uint32_t hardware_queues = 0;
+};
+class Registry {
+public:
+  void BeginExtension(ExtensionInfo extension);
+  void AddProvider(ProviderInfo provider);
+  void AddExcluded(ExcludedExtension extension);
+  void AddEmbeddingProvider(EmbeddingProvider provider);
+  void AddAsrProvider(AsrProvider provider);
+  void AddTtsProvider(TtsProvider provider);
+  void AddImageProvider(ImageProvider provider);
+  void AddVideoProvider(VideoProvider provider);
+  void AddDecisionProvider(DecisionProvider provider);
+  void AddTextProvider(TextProvider provider);
+  std::span<const ExcludedExtension> Excluded() const { return excluded_; }
+  // Empty means the key was not found among excluded extensions.
+  std::string ExcludedKeyDiagnostic(std::string_view key) const;
+  std::span<const ExtensionInfo> Extensions() const { return extensions_; }
+  std::span<const ProviderInfo> Providers() const { return providers_; }
+  const ProviderInfo& Provider(std::string_view id) const;
+
+private:
+  std::vector<ExtensionInfo> extensions_;
+  std::vector<ProviderInfo> providers_;
+  std::vector<ExcludedExtension> excluded_;
+  std::string current_extension_;
+};
+// Defined in generated per-executable source, never a static initializer.
+void RegisterBuiltExtensions(Registry& registry);
+// Defined beside the generated registry: discovery, explicit or lock.
+std::string_view ExtensionSelectionMode();
+}  // namespace gufo::ext

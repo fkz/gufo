@@ -10,14 +10,17 @@
 #include <string>
 #include <vector>
 
-#include "src/models/embedding_gemma2/audio_processor.hpp"
-#include "src/models/embedding_gemma2/image_processor.hpp"
+#include "audio_processor.hpp"
+#include "config.hpp"
+#include "image_processor.hpp"
 
 namespace gufo::models::embedding_gemma2 {
 
 struct SequenceImage {
   std::size_t offset{0};
   ImagePatches patches;
+  /// Video frames share the vision tower but use their own placeholders.
+  std::uint32_t token_id{kImageTokenId};
 };
 struct EncoderSequence {
   std::vector<std::uint32_t> tokens;

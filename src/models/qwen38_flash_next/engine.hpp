@@ -4,6 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <gufo/ext/prompt_lookup.hpp>
+#include <gufo/ext/sampling.hpp>
+#include <gufo/ext/session_mode.hpp>
 #include <memory>
 #include <optional>
 #include <span>
@@ -11,14 +14,11 @@
 #include <string_view>
 #include <vector>
 
-#include "src/core/sampling.hpp"
-#include "src/core/session_mode.hpp"
-#include "src/core/speculative/prompt_lookup.hpp"
-#include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen/vision/encoder.hpp"
-#include "src/models/qwen/vision/prompt.hpp"
+#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
+#include "src/families/qwen/text/tokenizer.hpp"
+#include "src/families/qwen/vision/encoder.hpp"
+#include "src/families/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
-#include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
@@ -86,10 +86,36 @@ public:
   [[nodiscard]] std::uint32_t VocabSize() const noexcept;
   [[nodiscard]] std::uint32_t PrefillCapacity() const noexcept;
   [[nodiscard]] std::uint32_t PrefillThroughCapacity() const noexcept;
+  /// Rows the next prompt step over `remaining` tokens may take under a
+  /// scheduler budget of `budget`: a wide pass when the budget allows more
+  /// than a narrow one (no session decodes beside it) and the executor can
+  /// map the wide scratch now; otherwise the narrow capacities above.
+  [[nodiscard]] std::size_t StepCapacity(std::size_t remaining,
+                                         std::size_t budget) const;
+  /// The through capacity of that step: the widest single pass it may
+  /// take.
+  [[nodiscard]] std::size_t StepThrough(std::size_t remaining,
+                                        std::size_t budget) const;
+  /// The pass widths the cache plans prompt captures around: the widest
+  /// passes, which a prompt alone takes when the host has the memory.
+  [[nodiscard]] std::size_t PlannedThrough() const noexcept;
+  [[nodiscard]] std::size_t PlannedChunk() const noexcept;
+  /// The chunk a pass that does not finish its prompt takes at the current
+  /// pass width.
+  [[nodiscard]] std::size_t PassChunk() const noexcept;
+  /// The widest single pass at the current pass width.
+  [[nodiscard]] std::size_t PassThrough() const noexcept;
+  /// Frees the wide pass scratch; decode steps and the idle scheduler call
+  /// it.
+  void ReleaseWidePasses() const;
   [[nodiscard]] std::uint32_t MaxContext() const noexcept {
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  /// Trunk tensors the official GGUF keeps in F32 but this artifact stores
+  /// as Q8_0 (see `ExpandedQ8_0Tensors`). The official MTP sidecar ships its
+  /// inject as Q8_0, so the draft block is not counted.
+  [[nodiscard]] std::size_t ExpandedQ8_0Tensors() const noexcept;
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
@@ -102,7 +128,18 @@ public:
   /// Worst-case private device state, including the configured rollback cap.
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const noexcept;
+  /// The part of SessionBytes() a session maps only as it writes it (K/V
+  /// regions); zero without demand mapping.
+  [[nodiscard]] std::size_t DemandMappedBytes(core::SessionMode mode,
+                                              std::uint32_t context) const;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
+  /// Caps wide copy verification (Executor::LimitCopyRows); call before any
+  /// session is created.
+  void LimitCopyRows(std::uint32_t rows) noexcept;
+  /// Splits the following prefill passes into at most `groups` layer groups
+  /// and calls `yield` between them, where other sessions may decode. One
+  /// group, or an empty `yield`, restores unsplit passes.
+  void SetPrefillYield(std::size_t groups, std::function<void()> yield) const;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
     return vision_;
@@ -156,11 +193,22 @@ public:
                                  std::unique_ptr<SessionSnapshot>* checkpoint,
                                  std::string* error_msg = nullptr,
                                  double* capture_ms = nullptr);
+  /// The same for ascending boundaries anywhere beyond the frontier: each
+  /// is captured inside the pass that covers it (at most
+  /// rocm::kMaxPassCheckpoints per pass), without splitting it.
+  /// `checkpoints` receives one snapshot per boundary.
+  [[nodiscard]] bool SyncThrough(
+      std::span<const std::int32_t> prompt,
+      std::span<const std::uint32_t> boundaries,
+      std::vector<std::unique_ptr<SessionSnapshot>>* checkpoints,
+      std::string* error_msg = nullptr, double* capture_ms = nullptr);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};
+    std::vector<sampling::TokenLogprobs> logprobs;
+    std::optional<sampling::TokenLogprobs> terminal_logprobs;
   };
   /// Greedy decoding verifies deterministic drafts. Sampled decoding draws
   /// compact MTP proposals and uses target/draft rejection with a residual
@@ -215,6 +263,8 @@ public:
   void SetCancellationCheck(std::function<bool()> check);
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  /// The account of this session's demand-mapped K/V.
+  [[nodiscard]] std::shared_ptr<mem::StateAccount> StateAccount() const;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy();
@@ -237,7 +287,7 @@ public:
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept;
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 18;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 20;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   [[nodiscard]] std::uint64_t PrefillCheckpointBytes(
@@ -266,19 +316,30 @@ private:
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
   void ResetImpl(bool reuse_mtp);
 
-  using PrefillCapture = std::function<void(const rocm::PrefillCheckpoint&)>;
-  bool SyncThroughComponents(std::span<const std::int32_t>, std::uint32_t,
-                             const PrefillCapture&, std::string*);
+  /// Receives the index of a boundary and its in-pass checkpoint view, or
+  /// null when the live session is at the boundary.
+  using PrefillCapture =
+      std::function<void(std::size_t, const rocm::PrefillCheckpoint*)>;
+  /// `next`, as for Sync, names the tokens the following step appends.
+  bool SyncThroughComponents(std::span<const std::int32_t>,
+                             std::span<const std::uint32_t>,
+                             const PrefillCapture&, std::string*,
+                             std::span<const std::int32_t> next = {});
+  /// True when `boundaries` ascend strictly beyond the frontier, within
+  /// `prompt`.
+  bool ValidCheckpointBoundaries(std::span<const std::int32_t> prompt,
+                                 std::span<const std::uint32_t> boundaries,
+                                 std::string* error_msg) const;
 
-  bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
-            bool prefill = false, std::uint32_t boundary = 0,
-            std::unique_ptr<SessionSnapshot>* checkpoint = nullptr,
-            double* capture_ms = nullptr,
-            std::span<const std::int32_t> after = {},
-            const PrefillCapture& capture = {});
+  bool Feed(
+      std::span<const std::int32_t> tokens, std::string* error_msg,
+      bool prefill = false, std::span<const std::uint32_t> boundaries = {},
+      std::vector<std::unique_ptr<SessionSnapshot>>* checkpoints = nullptr,
+      double* capture_ms = nullptr, std::span<const std::int32_t> after = {},
+      const PrefillCapture& capture = {});
   bool SyncImpl(std::span<const std::int32_t> prompt, std::string* error_msg,
-                std::uint32_t boundary,
-                std::unique_ptr<SessionSnapshot>* checkpoint,
+                std::span<const std::uint32_t> boundaries,
+                std::vector<std::unique_ptr<SessionSnapshot>>* checkpoints,
                 double* capture_ms = nullptr,
                 std::span<const std::int32_t> next = {},
                 const PrefillCapture& capture = {});
@@ -313,6 +374,8 @@ private:
                      std::optional<std::uint32_t> batch_drafts = {},
                      std::uint32_t occupancy = 1);
   static void AppendDraft(PendingDecode& pending);
+  /// Whether the chain ends after its latest neural proposal.
+  static bool GateStops(const PendingDecode& pending);
   /// Appends copies within the prepared budget, stopping at EOG when enabled.
   bool AppendLookup(PendingDecode& pending, bool stop_at_eos,
                     std::size_t minimum = 1, bool require_resume = false);
@@ -324,11 +387,19 @@ private:
   std::vector<std::int32_t> tokens_;
   std::vector<float> logits_;
   std::int32_t draft_token_{0};
+  float draft_confidence_{1.0F};  ///< the head's probability of draft_token_
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
   speculative::PromptLookup<> lookup_;
+  /// Verification rows (anchor included) the next copy-only cycle of a
+  /// greedy session decoding alone may use; 0 before the first. A copy
+  /// accepted whole at this width doubles it up to max_copy_rows(); any
+  /// rejected copy returns it to the ordinary verifier width.
+  std::uint32_t copy_rows_{0};
+  /// Whole copies accepted in a row at copy_rows_ (two widen it).
+  std::uint32_t copy_streak_{0};
   SpeculativeStats stats_;
   std::shared_ptr<const qwen::vision::Prompt> image_prompt_;
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
@@ -336,7 +407,7 @@ private:
   bool valid_{true};
   ContinuationHooks* continuation_hooks_{nullptr};
   /// This request's draft vocabulary; the device table follows it.
-  MtpDraftVocab draft_vocab_;
+  speculative::DraftVocab draft_vocab_;
   bool draft_vocab_stale_{false};
   std::vector<std::int32_t> draft_added_;
   /// After the token history is replaced: the table restarts from it.

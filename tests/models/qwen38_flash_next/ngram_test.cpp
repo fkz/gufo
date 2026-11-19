@@ -3,16 +3,20 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <random>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
 
 #include "src/core/platform/fs.hpp"
+#include "src/models/qwen38_flash_next/ngram_remainder.hpp"
 #include "tests/support/temporary_directory.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
@@ -106,6 +110,92 @@ void TestHash() {
     q::HashNgramRows(c, step, std::span<const std::int32_t>(&tokens[i], 1),
                      one);
     Check(one == expected[i], "single-step hash row");
+  }
+}
+
+void TestRemainders() {
+  std::mt19937_64 rng(716);
+  q::detail::HeadRemainder remainder;
+  const auto check = [&](std::uint32_t divisor) {
+    remainder.SetDivisor(divisor);
+    const auto verify = [&](std::uint64_t value) {
+      Check(remainder(value) == value % divisor, "exact reciprocal remainder");
+    };
+    for (const auto value :
+         {std::uint64_t{0}, std::uint64_t{1}, std::uint64_t{divisor - 1},
+          std::uint64_t{divisor}, std::numeric_limits<std::uint64_t>::max()})
+      verify(value);
+    for (int i = 0; i < 4096; ++i) {
+      const auto value = rng();
+      verify(value);
+      const auto multiple = (value / divisor) * divisor;
+      verify(multiple);
+      if (multiple != 0)
+        verify(multiple - 1);
+      if (multiple != std::numeric_limits<std::uint64_t>::max())
+        verify(multiple + 1);
+    }
+  };
+  check(1);
+  for (unsigned bit = 1; bit < 32; ++bit) {
+    const auto power = std::uint32_t{1} << bit;
+    check(power - 1);
+    check(power);
+    check(power + 1);
+  }
+  check(std::numeric_limits<std::uint32_t>::max());
+  for (int i = 0; i < 256; ++i)
+    check(static_cast<std::uint32_t>(rng()) | 1U);
+
+  // Reusing the same Config address must not retain a previous divisor.
+  q::Config c = FlashNextPle();
+  const std::array<std::int32_t, 1> tokens{123};
+  std::array<std::uint32_t, 16> rows{};
+  for (const std::uint32_t divisor : {20000003U, 1U, 4294967295U, 17U}) {
+    c.ple_head_vocab.fill(divisor);
+    c.ple_head_offsets.fill(0);
+    q::NgramHistory history;
+    q::HashNgramRows(c, history, tokens, rows);
+    for (std::uint32_t h = 0; h < c.ple_heads; ++h) {
+      auto mixed = std::uint64_t{123} * c.ple_multipliers[0];
+      for (std::uint32_t j = 1; j <= 1 + h / c.ple_heads_per_ngram; ++j)
+        mixed ^=
+            static_cast<std::uint64_t>(c.ple_eos_token) * c.ple_multipliers[j];
+      Check(rows[h] == mixed % divisor, "config divisor mutation");
+    }
+  }
+}
+
+void TestBf16Bits() {
+  TemporaryDirectory temp("qwen38-bf16-bits");
+  const auto path = temp.path() / "rows.bin";
+  constexpr std::uint32_t dim = 17;  // vector plus scalar tail
+  constexpr std::uint32_t count = (65536 + dim - 1) / dim;
+  {
+    std::ofstream file(path, std::ios::binary);
+    file.put(0);  // unaligned vector loads
+    for (std::uint32_t i = 0; i < count * dim; ++i) {
+      const auto bits = static_cast<std::uint16_t>(i);
+      file.write(reinterpret_cast<const char*>(&bits), 2);
+    }
+  }
+  std::string error;
+  auto table =
+      OpenTable(path, 1, count, dim, gufo::core::GgmlType::kBF16, &error);
+  Check(table != nullptr, error.c_str());
+  if (!table)
+    return;
+  std::vector<std::uint32_t> ids(count);
+  for (std::uint32_t i = 0; i < count; ++i)
+    ids[i] = i;
+  std::vector<float> out(count * dim);
+  for (int pass = 0; pass < 2; ++pass) {
+    Check(table->Read(ids, out), "exhaustive BF16 cold and cached read");
+    for (std::uint32_t i = 0; i < count * dim; ++i)
+      Check(
+          std::bit_cast<std::uint32_t>(out[i]) ==
+              (static_cast<std::uint32_t>(static_cast<std::uint16_t>(i)) << 16),
+          "BF16 preserves every bit pattern");
   }
 }
 
@@ -317,6 +407,60 @@ void TestQuantizedRows() {
   std::filesystem::remove(path);
 }
 
+// A Q8_0 table (the source converter's format) decodes exactly through the
+// same cold, cached and mixed gathers.
+void TestQ8Rows() {
+  const auto path =
+      std::filesystem::temp_directory_path() / "qwen38_ngram_q8.bin";
+  constexpr std::uint32_t dim = 160;
+  constexpr std::uint32_t rows = 129;
+  constexpr std::uint64_t offset = 4096 + 90;
+  const auto quant = [](std::uint32_t row, std::uint32_t col) {
+    return static_cast<int>((row * 7 + col * 3) % 255) - 127;
+  };
+  {
+    std::ofstream file(path, std::ios::binary);
+    file.seekp(offset);
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      for (std::uint32_t block = 0; block < dim / 32; ++block) {
+        // Exactly representable half scales: 0.5 and -2.
+        const std::uint16_t scale = row % 2 == 0 ? 0x3800 : 0xC000;
+        file.write(reinterpret_cast<const char*>(&scale), sizeof(scale));
+        for (std::uint32_t col = 0; col < 32; ++col)
+          file.put(static_cast<char>(
+              static_cast<std::int8_t>(quant(row, block * 32 + col))));
+      }
+    }
+    Check(file.good(), "Q8_0 fixture written");
+  }
+  std::string error;
+  auto table =
+      OpenTable(path, offset, rows, dim, gufo::core::GgmlType::kQ8_0, &error);
+  Check(table != nullptr, error.c_str());
+  if (table) {
+    const auto gather = [&](std::span<const std::uint32_t> ids) {
+      std::vector<float> out(ids.size() * dim + 16, -123.0F);
+      Check(table->Read(ids, std::span(out).first(ids.size() * dim)),
+            "Q8_0 gather completes");
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        const float scale = ids[i] % 2 == 0 ? 0.5F : -2.0F;
+        for (std::uint32_t col = 0; col < dim; ++col)
+          Check(out[i * dim + col] == scale * quant(ids[i], col),
+                "Q8_0 exact decoded value");
+      }
+      for (std::size_t i = ids.size() * dim; i < out.size(); ++i)
+        Check(out[i] == -123.0F, "Q8_0 output guard");
+    };
+    const std::array<std::uint32_t, 6> warm{0, 7, 128, 7, 0, 32};
+    gather(warm);
+    gather(warm);
+    const std::array<std::uint32_t, 7> mixed{128, 3, 7, 64, 3, 32, 1};
+    gather(mixed);
+  }
+  table.reset();
+  std::filesystem::remove(path);
+}
+
 // Widely spaced rows exercise cache eviction, including simultaneous readers
 // whose compressed rows map to the same bounded-cache slot.
 void TestDistantRows() {
@@ -484,8 +628,11 @@ void TestCounters() {
 int main() {
   TestReplacedPath();
   TestHash();
+  TestRemainders();
+  TestBf16Bits();
   TestTable();
   TestQuantizedRows();
+  TestQ8Rows();
   TestDistantRows();
   TestCounters();
   if (failures != 0) {

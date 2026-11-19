@@ -5,8 +5,11 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cinttypes>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -99,6 +102,59 @@ void ReleaseCommittedPages(void* base, std::size_t bytes) noexcept {
   }
 }
 
+bool CanVisitMappedChunks() noexcept {
+  return true;
+}
+
+void VisitMappedChunks(
+    const void* source_data, std::size_t bytes, std::size_t chunk_bytes,
+    std::size_t workers,
+    const std::function<bool(std::size_t worker, std::size_t offset,
+                             const void* chunk, std::size_t chunk_size)>&
+        visit) {
+  if (source_data == nullptr || bytes == 0 || chunk_bytes == 0)
+    return;
+  const auto chunks = bytes / chunk_bytes + (bytes % chunk_bytes != 0);
+  std::atomic<std::size_t> next{0};
+  std::atomic<int> failure{0};
+  std::atomic<bool> stopped{false};
+  auto visit_chunks = [&](std::size_t worker) {
+    while (failure.load(std::memory_order_relaxed) == 0 &&
+           !stopped.load(std::memory_order_relaxed)) {
+      const auto index = next.fetch_add(1, std::memory_order_relaxed);
+      if (index >= chunks)
+        break;
+      const auto offset = index * chunk_bytes;
+      const auto size = std::min(chunk_bytes, bytes - offset);
+      auto* input = const_cast<std::uint8_t*>(
+                        static_cast<const std::uint8_t*>(source_data)) +
+                    offset;
+      if (madvise(input, size, MADV_POPULATE_READ) != 0) {
+        failure.store(errno, std::memory_order_relaxed);
+        break;
+      }
+      const bool keep_going = visit(worker, offset, input, size);
+      // The visitor owns a copy of these bytes now. Keep the mapping valid
+      // for the reader without retaining its populated PTEs.
+      (void)madvise(input, size, MADV_DONTNEED);
+      if (!keep_going) {
+        stopped.store(true, std::memory_order_relaxed);
+        break;
+      }
+    }
+  };
+  {
+    std::vector<std::jthread> threads;
+    const auto count = std::clamp<std::size_t>(workers, 1, chunks);
+    for (std::size_t worker = 1; worker < count; ++worker)
+      threads.emplace_back(visit_chunks, worker);
+    visit_chunks(0);
+  }
+  if (const auto error = failure.load(); error != 0)
+    throw std::system_error(error, std::generic_category(),
+                            "cannot read mapped Qwen weights");
+}
+
 void* CloneMappedWeightsToAnonymousPages(const void* source_data,
                                          std::size_t bytes) {
   if (source_data == nullptr || bytes == 0) {
@@ -110,42 +166,18 @@ void* CloneMappedWeightsToAnonymousPages(const void* source_data,
     return nullptr;
   }
   (void)madvise(host_copy, bytes, MADV_HUGEPAGE);
-
-  constexpr std::size_t kChunkBytes = 16ULL << 20;
-  const auto chunks = bytes / kChunkBytes + (bytes % kChunkBytes != 0);
-  std::atomic<std::size_t> next{0};
-  std::atomic<int> failure{0};
-  auto copy_chunk = [&] {
-    while (failure.load(std::memory_order_relaxed) == 0) {
-      const auto index = next.fetch_add(1, std::memory_order_relaxed);
-      if (index >= chunks)
-        break;
-      const auto offset = index * kChunkBytes;
-      const auto chunk_bytes = std::min(kChunkBytes, bytes - offset);
-      auto* input = const_cast<std::uint8_t*>(
-                        static_cast<const std::uint8_t*>(source_data)) +
-                    offset;
-      if (madvise(input, chunk_bytes, MADV_POPULATE_READ) != 0) {
-        failure.store(errno, std::memory_order_relaxed);
-        break;
-      }
-      std::memcpy(static_cast<std::uint8_t*>(host_copy) + offset, input,
-                  chunk_bytes);
-      // The immutable copy now owns these resident bytes. Keep the original
-      // mapping valid for the reader without retaining its populated PTEs.
-      (void)madvise(input, chunk_bytes, MADV_DONTNEED);
-    }
-  };
-  {
-    std::vector<std::jthread> workers;
-    for (std::size_t i = 1; i < std::min<std::size_t>(16, chunks); ++i)
-      workers.emplace_back(copy_chunk);
-    copy_chunk();
-  }
-  if (const auto error = failure.load(); error != 0) {
+  try {
+    VisitMappedChunks(source_data, bytes, 16ULL << 20, 16,
+                      [&](std::size_t, std::size_t offset, const void* chunk,
+                          std::size_t size) {
+                        std::memcpy(
+                            static_cast<std::uint8_t*>(host_copy) + offset,
+                            chunk, size);
+                        return true;
+                      });
+  } catch (...) {
     munmap(host_copy, bytes);
-    throw std::system_error(error, std::generic_category(),
-                            "cannot read mapped Qwen weights");
+    throw;
   }
   return host_copy;
 }
@@ -258,6 +290,64 @@ void ReleaseSharedTempMapping(SharedTempMapping& mapping) noexcept {
     close(static_cast<int>(mapping.handle));
   }
   mapping = {};
+}
+
+bool DevicePagesUseHostMemory() noexcept {
+  return true;
+}
+
+bool CanMapDeviceFiles() noexcept {
+  return true;
+}
+
+bool IsAddressRangeReserved(const void* address, std::size_t bytes) {
+  // /proc/self/maps lists mappings in address order; walk the covering run.
+  std::ifstream maps("/proc/self/maps");
+  if (!maps)
+    return false;
+  auto next = reinterpret_cast<std::uintptr_t>(address);
+  const auto end = next + bytes;
+  for (std::string line; next < end && std::getline(maps, line);) {
+    std::uintptr_t lo = 0, hi = 0;
+    if (std::sscanf(line.c_str(), "%" SCNxPTR "-%" SCNxPTR, &lo, &hi) != 2)
+      return false;
+    if (hi <= next)
+      continue;
+    if (lo > next)
+      return false;
+    next = hi;
+  }
+  return next >= end;
+}
+
+bool MapDeviceFileAt(void* address, std::size_t bytes,
+                     std::intptr_t handle) noexcept {
+  const int fd = static_cast<int>(handle);
+  void* mapped = mmap(address, bytes, PROT_READ | PROT_WRITE,
+                      MAP_SHARED | MAP_FIXED, fd, 0);
+  close(fd);
+  if (mapped != address)
+    return false;
+  // The driver fills the page table on fault, a few pages at a time, and
+  // MAP_POPULATE does not apply. Fault it in now, for reads and writes: on
+  // 128 MiB the first CPU read took 13.3 ms instead of 5.1 ms and the first
+  // write 6.7 ms instead of 2.3 ms (after a read-only touch), on a capture
+  // path. Rewriting one byte per page with itself costs about 5 ms per
+  // 128 MiB here, when the pages are committed and nothing else uses them.
+  const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+  auto* data = static_cast<volatile std::byte*>(address);
+  for (std::size_t offset = 0; offset < bytes; offset += page)
+    data[offset] = data[offset];
+  return true;
+}
+
+void CloseDeviceFile(std::intptr_t handle) noexcept {
+  close(static_cast<int>(handle));
+}
+
+void UnmapDeviceFileAt(void* address, std::size_t bytes) noexcept {
+  (void)mmap(address, bytes, PROT_NONE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
 }
 
 }  // namespace gufo::platform

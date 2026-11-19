@@ -52,6 +52,43 @@ class WindowsBundleTest(unittest.TestCase):
                 (root / "libmpg123.dll").touch()
                 self.assertEqual(bundle.check_bundle(root), [])
 
+    def test_video_imports_allow_ncrypt_but_require_bundled_codecs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("gufo.exe", "avformat-63.dll"):
+                (root / name).touch()
+            imports = {
+                "gufo.exe": {"avformat-63.dll"},
+                "avformat-63.dll": {"NCRYPT.DLL", "avcodec-63.dll"},
+                "avcodec-63.dll": {"kernel32.dll"},
+            }
+            with patch.object(bundle, "imported_dlls", side_effect=lambda p: imports[p.name]):
+                self.assertEqual(
+                    bundle.check_bundle(root),
+                    ["avformat-63.dll requires unbundled avcodec-63.dll"],
+                )
+                (root / "avcodec-63.dll").touch()
+                self.assertEqual(bundle.check_bundle(root), [])
+
+    def test_rust_standard_library_imports_are_system_dlls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "gufo.exe").touch()
+            imports = {"gufo.exe": {"bcryptprimitives.dll", "USERENV.dll", "kernel32.dll"}}
+            with patch.object(bundle, "imported_dlls", side_effect=lambda p: imports[p.name]):
+                self.assertEqual(bundle.check_bundle(root), [])
+
+    def test_lazy_video_libraries_are_required_without_pe_imports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "gufo.exe").touch()
+            (root / "gufo-video-libraries.txt").write_text("avformat-63.dll\n", encoding="utf-8")
+            with patch.object(bundle, "imported_dlls", return_value={"kernel32.dll"}):
+                self.assertEqual(bundle.check_bundle(root),
+                                 ["video runtime requires unbundled avformat-63.dll"])
+                (root / "AVFORMAT-63.DLL").touch()
+                self.assertEqual(bundle.check_bundle(root), [])
+
     def test_developer_and_crt_libraries_are_not_system_dependencies(self):
         for name in ("libomp140.x86_64.dll", "libomp.dll", "msvcp140.dll", "vcruntime140.dll"):
             with self.subTest(name=name):
@@ -70,6 +107,47 @@ class WindowsBundleTest(unittest.TestCase):
             reader.return_value.__enter__.return_value = pe
             with patch.object(pe, "parse_data_directories", create=True):
                 self.assertEqual(bundle.imported_dlls(Path("gufo.exe")), {"kernel32.dll", "missing.dll"})
+                self.assertEqual(bundle.imported_dlls(Path("gufo.exe"), delayed_only=True),
+                                 {"missing.dll"})
+
+    def test_driver_libraries_must_be_delay_loaded_and_not_bundled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "gufo.exe").touch()
+            imports = {"gufo.exe": {"xrt_coreutil.dll", "kernel32.dll"}}
+            delayed = {"gufo.exe": set()}
+
+            def fake(path, delayed_only=False):
+                return (delayed if delayed_only else imports)[path.name]
+
+            with patch.object(bundle, "imported_dlls", side_effect=fake):
+                self.assertEqual(
+                    bundle.check_bundle(root),
+                    ["gufo.exe must delay-load driver library xrt_coreutil.dll"],
+                )
+                delayed["gufo.exe"] = {"xrt_coreutil.dll"}
+                self.assertEqual(bundle.check_bundle(root), [])
+                imports["xrt_coreutil.dll"] = {"kernel32.dll"}
+                (root / "xrt_coreutil.dll").touch()
+                self.assertEqual(
+                    bundle.check_bundle(root),
+                    ["bundle ships xrt_coreutil.dll, which must come from its driver"],
+                )
+
+    def test_npu_dispatch_libraries_import_system_dlls_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "gufo.exe").touch()
+            (root / "npu" / "q8gemm").mkdir(parents=True)
+            (root / "npu" / "q8gemm" / "q8gemm_dispatch.so").touch()
+            imports = {"gufo.exe": {"kernel32.dll"}, "q8gemm_dispatch.so": {"kernel32.dll"}}
+            with patch.object(bundle, "imported_dlls", side_effect=lambda p: imports[p.name]):
+                self.assertEqual(bundle.check_bundle(root), [])
+                imports["q8gemm_dispatch.so"].add("vcruntime140.dll")
+                self.assertEqual(
+                    bundle.check_bundle(root),
+                    ["npu/q8gemm/q8gemm_dispatch.so requires non-system vcruntime140.dll"],
+                )
 
     def test_missing_executable_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -37,8 +37,8 @@ def reclaim_evidence(segment):
 
 
 def wait_until(predicate, timeout, description):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
         value = predicate()
         if value:
             return value
@@ -109,14 +109,14 @@ def run_case(args, command, case, report):
                 "reasoning_effort": "low", "max_tokens": 32,
                 "cache_prompt": cache, "stream": False}
         write_json(output / f"{label}.request.json", body)
-        start = time.monotonic()
+        start = time.perf_counter()
         request = urllib.request.Request(base + "/v1/chat/completions",
             data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=300) as response:
             answer = json.load(response)
         write_json(output / f"{label}.response.json", answer)
         assert "error" not in answer and answer.get("choices"), answer
-        row["requests"][label] = {"wall_ms": (time.monotonic() - start) * 1000,
+        row["requests"][label] = {"wall_ms": (time.perf_counter() - start) * 1000,
                                    "usage": answer["usage"]}
         write_json(args.output / "report.json", report)
         return answer
@@ -263,7 +263,7 @@ def main():
     if "reclaim" in (args.case or ()) and int(option(
             command, "--cache-ram-bytes", str(RECLAIM_RAM_BYTES))) != RECLAIM_RAM_BYTES:
         parser.error("the reclaim case requires --cache-ram-bytes 268435456")
-    for reserved in ("--host", "--port", "--cache-disk", "--cache-disk-bytes", "--api-key"):
+    for reserved in ("--host", "--port", "--cache-disk", "--cache-disk-bytes"):
         if option(command, reserved) is not None:
             parser.error(f"the runner owns {reserved}")
     if option(command, "--served-model-name") is None:

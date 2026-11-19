@@ -10,8 +10,9 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
-#include "src/models/minimax_h3/generation.hpp"
+#include "src/ext/video.hpp"
 
 namespace gufo::server {
 
@@ -41,8 +42,15 @@ struct VideoJobRequest {
   std::string size{"512x512"};
   std::string seconds{"1"};
   std::string output_format{"mp4"};
-  minimax_h3::GenerationParameters parameters;
+  ext::VideoParameters parameters;
   std::uint64_t seed{42};
+  /// Uploaded keyframe bytes for conditioning (issue #177), already
+  /// decoded and validated at admission. Empty selects no anchor. Create()
+  /// stages each non-empty vector as `first_frame.img`/`last_frame.img`
+  /// INSIDE the job directory so cancellation, DELETE, and TTL expiry sweeps
+  /// reclaim the uploaded imagery together with the generated output.
+  std::vector<std::uint8_t> first_frame_bytes;
+  std::vector<std::uint8_t> last_frame_bytes;
 };
 
 struct VideoJobSnapshot {
@@ -58,6 +66,12 @@ struct VideoJobSnapshot {
   std::string output_format;
   std::string error_code;
   std::string error_message;
+  /// SHA-256 of the staged keyframe bytes, verbatim as uploaded in any
+  /// accepted format ("" when absent). Kept in
+  /// the persisted snapshot so job provenance survives restart recovery and
+  /// is merged into the job's parameters.json report.
+  std::string first_frame_sha256;
+  std::string last_frame_sha256;
 };
 
 struct VideoJobContent {
@@ -72,13 +86,15 @@ struct VideoJobServiceOptions {
   std::filesystem::path storage_root;
   std::size_t queue_capacity{1};
   std::chrono::seconds artifact_ttl{std::chrono::hours(1)};
+  /// Additional IDs accepted from requests. They behave as the root
+  /// `minimax-h3` name; the preset-selecting variants stay fixed (#957).
+  std::vector<std::string> model_aliases;
   bool validate_model_inventory{true};
   std::function<std::string()> id_factory;
   std::function<std::int64_t()> now;
-  std::function<bool(const minimax_h3::GenerationRequest&,
-                     const minimax_h3::CancellationToken*,
-                     minimax_h3::GenerationProgress, void*,
-                     minimax_h3::GenerationTelemetry*, std::string*)>
+  std::function<bool(const ext::VideoRequest&, const ext::CancellationCheck&,
+                     ext::VideoProgress, void*, ext::VideoTelemetry*,
+                     std::string*)>
       runner;
 };
 
@@ -112,6 +128,12 @@ public:
 
   [[nodiscard]] bool ready() const noexcept;
   [[nodiscard]] std::string initialization_error() const;
+  /// True for a canonical `minimax-h3` name or a configured alias (#957).
+  [[nodiscard]] bool serves_model(std::string_view name) const;
+  /// The request name as a canonical model: aliases map to the root
+  /// `minimax-h3`, unknown names are returned unchanged for rejection.
+  [[nodiscard]] std::string normalize_model(std::string_view name) const;
+  [[nodiscard]] const std::vector<std::string>& model_aliases() const;
   [[nodiscard]] VideoJobCreateResult Create(const VideoJobRequest& request);
   [[nodiscard]] VideoJobLookupResult Get(std::string_view id);
   [[nodiscard]] VideoJobContentResult Content(std::string_view id);

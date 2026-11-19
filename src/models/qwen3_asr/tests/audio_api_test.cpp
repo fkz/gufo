@@ -7,9 +7,9 @@
 #include <string>
 #include <utility>
 
-#include "src/cli/serve/asr_service.hpp"
-#include "src/cli/serve/audio_asr_api.hpp"
 #include "src/models/qwen3_asr/audio.hpp"
+#include "src/models/qwen3_asr/transcription.hpp"
+#include "tests/support/model_api_test_support.hpp"
 
 namespace {
 
@@ -41,6 +41,12 @@ public:
     context = request.context;
     language = request.language;
     maximum_tokens = request.max_new_tokens;
+    if (fail) {
+      result->invalid_audio = invalid_audio;
+      if (error != nullptr)
+        *error = "Qwen3-ASR audio is truncated";
+      return false;
+    }
     result->language = "English";
     result->text = "A native transcript.";
     result->audio_samples = 32000;
@@ -56,6 +62,8 @@ public:
     return true;
   }
 
+  bool fail{false};
+  bool invalid_audio{false};
   int calls{0};
   std::size_t wav_bytes{0};
   std::string context;
@@ -78,7 +86,7 @@ AsrService MakeService(FakeRunner* runner) {
 }
 
 std::string Multipart(std::string response_format = "json",
-                      bool include_unknown = false,
+                      std::string_view extra_field = {},
                       std::string_view stream = {}) {
   constexpr std::string_view boundary = "gufo-test-boundary";
   std::string body;
@@ -107,8 +115,8 @@ std::string Multipart(std::string response_format = "json",
   append("temperature", "0");
   if (!stream.empty())
     append("stream", stream);
-  if (include_unknown) {
-    append("typo", "true");
+  if (!extra_field.empty()) {
+    append(extra_field, "logprobs");
   }
   body += "--";
   body += boundary;
@@ -175,17 +183,48 @@ void TestFormatsAndValidation() {
         "verbose_json exposes duration and language");
   Check(Send(service, Multipart("srt")).status == 400,
         "unsupported response formats fail closed");
-  Check(Send(service, Multipart("json", true)).status == 400,
-        "unknown multipart fields fail closed");
+  Check(Send(service, Multipart("json", "typo")).status == 200,
+        "unknown multipart fields are ignored");
+  Check(Send(service, Multipart("json", "include[]")).status == 400,
+        "logprobs requests fail closed");
   Check(Send(service, Multipart(), "application/json").status == 400,
         "non-multipart requests fail closed");
-  Check(runner.calls == 2, "invalid requests never invoke inference");
+  Check(runner.calls == 3, "invalid requests never invoke inference");
+}
+
+void TestFailures() {
+  FakeRunner runner;
+  AsrService service = MakeService(&runner);
+  runner.fail = true;
+  runner.invalid_audio = true;
+  const HttpResponse malformed = Send(service, Multipart());
+  Check(malformed.status == 400 &&
+            malformed.body.find("\"code\":\"invalid_audio_input\"") !=
+                std::string::npos &&
+            malformed.body.find("audio is truncated") != std::string::npos,
+        "undecodable audio is a client error");
+  const auto stream = Send(service, Multipart("json", {}, "true"));
+  std::string events;
+  stream.streaming_body([&](std::string_view part) {
+    events += part;
+    return true;
+  });
+  Check(
+      stream.stream_log->error_code == "invalid_audio_input" &&
+          events.find("\"code\":\"invalid_audio_input\"") != std::string::npos,
+      "streaming reports undecodable audio as invalid input");
+  runner.invalid_audio = false;
+  const HttpResponse failed = Send(service, Multipart());
+  Check(failed.status == 500 &&
+            failed.body.find("\"code\":\"transcription_failed\"") !=
+                std::string::npos,
+        "other runner failures stay server errors");
 }
 
 void TestStreamingAndChunks() {
   FakeRunner runner;
   AsrService service = MakeService(&runner);
-  const auto response = Send(service, Multipart("json", false, "true"));
+  const auto response = Send(service, Multipart("json", {}, "true"));
   Check(response.status == 200 && response.streaming_body && runner.calls == 0,
         "streaming defers inference until the response is consumed");
   std::string events;
@@ -199,7 +238,7 @@ void TestStreamingAndChunks() {
           events.find("\"delta\":\" transcript.\"") != std::string::npos &&
           events.find("\"type\":\"transcript.text.done\"") != std::string::npos,
       "OpenAI SSE emits incremental deltas and a complete transcript");
-  const auto disconnected = Send(service, Multipart("json", false, "true"));
+  const auto disconnected = Send(service, Multipart("json", {}, "true"));
   int writes = 0;
   disconnected.streaming_body([&](std::string_view) {
     ++writes;
@@ -207,10 +246,10 @@ void TestStreamingAndChunks() {
   });
   Check(writes == 1 && disconnected.stream_log->error_code == "cancelled",
         "disconnected stream cancels inference without a done event");
-  Check(!Send(service, Multipart("json", false, "false")).streaming_body,
+  Check(!Send(service, Multipart("json", {}, "false")).streaming_body,
         "stream=false retains the ordinary JSON contract");
-  Check(Send(service, Multipart("json", false, "yes")).status == 400 &&
-            Send(service, Multipart("text", false, "true")).status == 400,
+  Check(Send(service, Multipart("json", {}, "yes")).status == 400 &&
+            Send(service, Multipart("text", {}, "true")).status == 400,
         "invalid streaming configurations fail closed");
 
   constexpr std::size_t limit = 4 * qwen3_asr::kAudioSampleRate;
@@ -245,6 +284,7 @@ void TestStreamingAndChunks() {
 int main() {
   TestJsonRequest();
   TestFormatsAndValidation();
+  TestFailures();
   TestStreamingAndChunks();
   std::cout << "PASS qwen3_asr_audio_api_test\n";
   return 0;

@@ -37,6 +37,9 @@ HERE = Path(__file__).resolve().parent
 FIXTURES = HERE.parent / "fixtures"
 AUDIO = HERE / "fixtures" / "audio"
 MINIMUM_EMBEDDING_COSINE = 0.9999
+# The NPU rounds every matrix product to bfp16 (worst measured 0.99894 on the
+# embedding fixtures).
+MINIMUM_NPU_EMBEDDING_COSINE = 0.998
 MAXIMUM_ASR_WER = 0.15
 MAXIMUM_TTS_WER = 0.25
 TTS_TEXT = "The little brown dog ran across the garden."
@@ -96,19 +99,19 @@ def server(binary, service, model, extra, log_path, timeout):
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
         try:
-            started = time.monotonic()
+            started = time.perf_counter()
             while True:
                 if process.poll() is not None:
                     raise RuntimeError(f"{service} server exited with {process.returncode} "
                                        f"before /ready; see {log_path}")
-                if time.monotonic() - started > timeout:
+                if time.perf_counter() - started > timeout:
                     raise TimeoutError(f"{service} server not ready after {timeout} s")
                 try:
                     request(url + "/ready", timeout=5)
                     break
                 except (urllib.error.URLError, ConnectionError, TimeoutError):
                     time.sleep(1)
-            print(f"{service} ready in {time.monotonic() - started:.1f} s", flush=True)
+            print(f"{service} ready in {time.perf_counter() - started:.1f} s", flush=True)
             yield url
             if process.poll() is not None:
                 raise RuntimeError(f"{service} server exited during the check")
@@ -124,7 +127,8 @@ def check_embedding(args):
     golden = json.loads((FIXTURES / "embedding_gemma2" / "embedding_golden.json")
                         .read_text(encoding="utf-8"))
     cases = list(golden["cases"])
-    with server(args.binary, "embedding", args.model, ["--served-model-name", "embeddinggemma-2"],
+    extra = ["--served-model-name", "embeddinggemma-2"] + (["--npu"] if args.npu else [])
+    with server(args.binary, "embedding", args.model, extra,
                 args.log_dir / "embedding-server.log", args.startup_timeout) as url:
         result = request(url + "/v1/embeddings", {
             "model": "embeddinggemma-2", "input": [case["text"] for case in cases],
@@ -161,7 +165,8 @@ def check_embedding(args):
         similarity = cosine(vector, case["embedding"])
         print(f"  {case['name']}: cosine {similarity:.6f}")
         worst = min(worst, similarity)
-    assert worst >= MINIMUM_EMBEDDING_COSINE, f"worst cosine {worst:.6f} < {MINIMUM_EMBEDDING_COSINE}"
+    minimum = MINIMUM_NPU_EMBEDDING_COSINE if args.npu else MINIMUM_EMBEDDING_COSINE
+    assert worst >= minimum, f"worst cosine {worst:.6f} < {minimum}"
     return f"{len(cases) - 1} golden texts and one audio clip, worst cosine {worst:.6f}"
 
 
@@ -171,7 +176,8 @@ def check_asr(args):
     body, content_type = multipart({"model": "qwen3-asr", "language": "English",
                                     "max_tokens": "128"},
                                    "file", "speech.wav", audio.read_bytes(), "audio/wav")
-    with server(args.binary, "asr", args.model, ["--served-model-name", "qwen3-asr"],
+    extra = ["--served-model-name", "qwen3-asr"] + (["--npu"] if args.npu else [])
+    with server(args.binary, "asr", args.model, extra,
                 args.log_dir / "asr-server.log", args.startup_timeout) as url:
         result = request(url + "/v1/audio/transcriptions", body=body, content_type=content_type)
     wer = word_error_rate(result["text"], expected)
@@ -184,6 +190,7 @@ def check_tts(args):
     reference = AUDIO / "clear-english-voice.wav"
     voice = ["--served-model-name", "qwen3-tts", "--voice", f"narrator={reference}",
              "--voice-text", f"narrator={reference.with_suffix('.txt')}"]
+    voice += ["--npu"] if args.npu else []
     with server(args.binary, "tts", args.model, voice, args.log_dir / "tts-server.log",
                 args.startup_timeout) as url:
         data = request(url + "/v1/audio/speech", {
@@ -243,12 +250,15 @@ def main():
     parser.add_argument("--model", type=Path, required=True,
                         help="Model directory, or the GGUF file for llm")
     parser.add_argument("--asr-model", type=Path, help="tts: Qwen3-ASR directory for a round trip")
+    parser.add_argument("--npu", action="store_true", help="Run embedding, ASR or TTS on the NPU")
     parser.add_argument("--startup-timeout", type=int, default=900)
     parser.add_argument("--log-dir", type=Path, default=Path("."))
     args = parser.parse_args()
+    if args.npu and args.family == "llm":
+        parser.error("--npu is supported only for embedding, asr and tts")
     args.log_dir.mkdir(parents=True, exist_ok=True)
 
-    started = time.monotonic()
+    started = time.perf_counter()
     try:
         summary = FAMILIES[args.family](args)
     except Exception as error:
@@ -257,7 +267,7 @@ def main():
             print(f"--- {log.name} (tail) ---", file=sys.stderr)
             print(log.read_text(encoding="utf-8", errors="replace")[-4000:], file=sys.stderr)
         return 1
-    print(f"PASS {args.family}: {summary} ({time.monotonic() - started:.1f} s)")
+    print(f"PASS {args.family}: {summary} ({time.perf_counter() - started:.1f} s)")
     return 0
 
 

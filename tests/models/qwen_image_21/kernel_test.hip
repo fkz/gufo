@@ -1,12 +1,16 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cassert>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <random>
+#include <stdexcept>
 #include <tuple>
 #include <vector>
 
@@ -350,6 +354,49 @@ void Fused(bool masked) {
                              hipMemcpyDeviceToHost));
       assert(output == replay);
     }
+    // Condition caches read in place: the same keys split into three
+    // head-major segments with padded strides give identical results, both
+    // for long segments and for short ones inside one 32-key block.
+    image::FusedAttention128(q.data, k.data, v.data, o.data, heads, rows, keys,
+                             0, nullptr, rows, mask);
+    image::Check(hipMemcpy(output.data(), o.data, output.size() * 2,
+                           hipMemcpyDeviceToHost));
+    for (const auto& sizes :
+         {std::array{keys / 3, keys / 2 - keys / 3, keys - keys / 2},
+          std::array{keys - 40, 9, 31}}) {
+      const int strides[3] = {sizes[0] + 7, sizes[1], sizes[2] + 3};
+      std::vector<std::unique_ptr<Device<std::uint16_t>>> parts;
+      image::KeySegments segments;
+      for (int s = 0, first = 0; s < 3; first += sizes[s], ++s) {
+        std::vector<std::uint16_t> part_keys(heads * strides[s] * dim,
+                                             sentinel),
+            part_values(part_keys.size(), sentinel);
+        for (int head = 0; head < heads; ++head)
+          for (int row = 0; row < sizes[s]; ++row)
+            for (int d = 0; d < dim; ++d) {
+              const auto from = (head * keys + first + row) * dim + d;
+              const auto to = (head * strides[s] + row) * dim + d;
+              part_keys[to] = key_values[from];
+              part_values[to] = values[from];
+            }
+        for (auto* host : {&part_keys, &part_values}) {
+          parts.push_back(
+              std::make_unique<Device<std::uint16_t>>(host->size()));
+          image::Check(hipMemcpy(parts.back()->data, host->data(),
+                                 host->size() * 2, hipMemcpyHostToDevice));
+        }
+        segments.keys[s] = parts[parts.size() - 2]->data;
+        segments.values[s] = parts.back()->data;
+        segments.end[s] = first + sizes[s];
+        segments.stride[s] = strides[s];
+      }
+      image::FusedAttention128Segmented(q.data, segments, o.data, heads, rows,
+                                        0, rows, nullptr, mask);
+      image::Check(hipGetLastError());
+      image::Check(hipMemcpy(replay.data(), o.data, replay.size() * 2,
+                             hipMemcpyDeviceToHost));
+      assert(output == replay);
+    }
   }
 }
 
@@ -609,6 +656,91 @@ void ConvolutionLayout() {
     }
   }
 }
+
+void LoraMerge() {
+  hipblasHandle_t blas{};
+  if (hipblasCreate(&blas) != HIPBLAS_STATUS_SUCCESS)
+    throw std::runtime_error("hipblasCreate failed");
+  std::mt19937 rng(97);
+  std::uniform_real_distribution<float> uniform(-1, 1), spread(0.8F, 1.2F);
+  for (auto [rows, cols, rank] :
+       {std::tuple{96, 80, 5}, {96, 80, 1}, {1, 80, 5}}) {
+    const auto random = [&](std::size_t count) {
+      std::vector<float> values(count);
+      for (float& value : values)
+        value = uniform(rng);
+      return values;
+    };
+    const std::size_t count = std::size_t(rows) * cols;
+    const auto weight = random(count), up = random(std::size_t(rows) * rank),
+               down = random(std::size_t(rank) * cols);
+    float max_weight = 0;
+    for (float value : weight)
+      max_weight = std::max(max_weight, std::abs(value));
+    std::vector<double> norms(rows);
+    std::vector<float> magnitude(rows);
+    for (int r = 0; r < rows; ++r) {
+      for (int c = 0; c < cols; ++c)
+        norms[r] += double(weight[r * cols + c]) * weight[r * cols + c];
+      norms[r] = std::sqrt(norms[r]);
+      magnitude[r] = static_cast<float>(norms[r] * spread(rng));
+    }
+    Device<float> w(count), delta(count), u(up.size()), d(down.size()),
+        m(magnitude.size());
+    image::Check(hipMemcpy(u.data, up.data(), up.size() * 4,
+                           hipMemcpyHostToDevice));
+    image::Check(hipMemcpy(d.data, down.data(), down.size() * 4,
+                           hipMemcpyHostToDevice));
+    image::Check(hipMemcpy(m.data, magnitude.data(), magnitude.size() * 4,
+                           hipMemcpyHostToDevice));
+    constexpr float kScale = 0.37F;
+    const auto run = [&](float strength, bool dora) {
+      image::Check(hipMemcpy(w.data, weight.data(), count * 4,
+                             hipMemcpyHostToDevice));
+      if (dora) {
+        image::Check(hipMemset(delta.data, 0, count * 4));
+        image::LoraLowRank(blas, delta.data, u.data, d.data, rows, cols, rank,
+                           kScale);
+        image::LoraDora(w.data, delta.data, m.data, rows, cols, strength,
+                        nullptr);
+      } else {
+        image::LoraLowRank(blas, w.data, u.data, d.data, rows, cols, rank,
+                           kScale * strength);
+      }
+      image::Check(hipGetLastError());
+      image::Check(hipDeviceSynchronize());
+      std::vector<float> result(count);
+      image::Check(
+          hipMemcpy(result.data(), w.data, count * 4, hipMemcpyDeviceToHost));
+      return result;
+    };
+    for (auto [strength, dora] :
+         {std::pair{1.0F, false}, {0.6F, false}, {1.0F, true}, {0.6F, true}}) {
+      const auto actual = run(strength, dora);
+      assert(run(strength, dora) == actual);
+      double max_error = 0;
+      for (int r = 0; r < rows; ++r) {
+        // ComfyUI DoRA divides by the pre-update row norm plus FP32 epsilon.
+        const double scale = magnitude[r] / (norms[r] + FLT_EPSILON);
+        for (int c = 0; c < cols; ++c) {
+          double product = 0;
+          for (int k = 0; k < rank; ++k)
+            product += double(up[r * rank + k]) * down[k * cols + c];
+          const double base = weight[r * cols + c];
+          double expected = base + kScale * strength * product;
+          if (dora) {
+            const double calc = (base + kScale * product) * scale;
+            expected = base + strength * (calc - base);
+          }
+          max_error =
+              std::max(max_error, std::abs(actual[r * cols + c] - expected));
+        }
+      }
+      assert(max_error <= 1e-5 * max_weight);
+    }
+  }
+  (void)hipblasDestroy(blas);
+}
 }  // namespace
 
 int main() {
@@ -625,6 +757,7 @@ int main() {
   Dense();
   Convolution();
   ConvolutionLayout();
+  LoraMerge();
   std::cout << "Qwen-Image exact layouts and attention/projection FP64 oracles "
                "passed\n";
 }

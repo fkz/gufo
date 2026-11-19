@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/base64.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::server {
@@ -68,24 +69,6 @@ HttpResponse BadRequest(std::string message, std::string code) {
   return Error(400, std::move(message), std::move(code));
 }
 
-std::string Base64(std::span<const std::uint8_t> bytes) {
-  constexpr std::string_view alphabet =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string output;
-  output.reserve((bytes.size() + 2U) / 3U * 4U);
-  for (std::size_t i = 0; i < bytes.size(); i += 3U) {
-    const std::uint32_t word =
-        (std::uint32_t{bytes[i]} << 16U) |
-        (i + 1U < bytes.size() ? std::uint32_t{bytes[i + 1U]} << 8U : 0U) |
-        (i + 2U < bytes.size() ? std::uint32_t{bytes[i + 2U]} : 0U);
-    output += alphabet[(word >> 18U) & 63U];
-    output += alphabet[(word >> 12U) & 63U];
-    output += i + 1U < bytes.size() ? alphabet[(word >> 6U) & 63U] : '=';
-    output += i + 2U < bytes.size() ? alphabet[word & 63U] : '=';
-  }
-  return output;
-}
-
 /// Little-endian IEEE-754 binary32, as OpenAI's base64 format specifies.
 std::string EncodeBase64Floats(std::span<const float> values) {
   std::vector<std::uint8_t> bytes;
@@ -96,7 +79,7 @@ std::string EncodeBase64Floats(std::span<const float> values) {
       bytes.push_back(static_cast<std::uint8_t>((bits >> shift) & 0xFFU));
     }
   }
-  return Base64(bytes);
+  return core::EncodeBase64(bytes);
 }
 
 /// Shortest decimal text that parses back to the same float.
@@ -164,13 +147,6 @@ bool LooksLikeAudio(std::string_view base64) {
          starts(0, "OggS");
 }
 
-bool IsKnownField(std::string_view name, bool native) {
-  return name == "input" || name == "model" || name == "encoding_format" ||
-         name == "dimensions" || name == "user" || name == "truncate" ||
-         name == "prompt_name" ||
-         (native && (name == "content" || name == "embd_normalize"));
-}
-
 /// The member's value, or nullptr when it is absent or null.
 const json::Value* Optional(const json::Value& root, const std::string& name) {
   const json::Value* value = root.find(name);
@@ -190,36 +166,32 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
     return BadRequest("request body must be a JSON object",
                       "invalid_request_body");
   }
-  for (const auto& [name, unused] : root.members()) {
-    (void)unused;
-    if (!IsKnownField(name, native)) {
-      return BadRequest("unsupported embeddings parameter: " + name,
-                        "unsupported_field");
-    }
-  }
+  // As in llama.cpp, TEI, vLLM and Ollama, unknown members are ignored.
 
   if (const json::Value* model = Optional(root, "model"); model != nullptr) {
     if (!model->is_string()) {
       return BadRequest("'model' must be a string", "invalid_parameter_type");
     }
-    if (model->str() != service.model_id()) {
+    if (!service.serves_model(model->str())) {
       return Error(404, "requested embedding model is not loaded",
                    "model_not_found");
     }
   }
 
   const json::Value* input = Optional(root, "input");
-  // As in llama.cpp, `input` takes precedence over the legacy `content`.
-  if (input == nullptr && native)
-    input = Optional(root, "content");
+  // As in llama.cpp, `input` takes precedence over the legacy `content`, and
+  // `content` selects the native form on either route.
   if (input == nullptr) {
-    return BadRequest(
-        native ? "'input' or 'content' is required" : "'input' is required",
-        "missing_input");
+    input = Optional(root, "content");
+    native = native || input != nullptr;
+  }
+  if (input == nullptr) {
+    return BadRequest("'input' or 'content' is required", "missing_input");
   }
   std::vector<EmbeddingInput> inputs;
   std::size_t image_count = 0;
   std::size_t audio_count = 0;
+  std::size_t video_count = 0;
   const auto parse_item = [&](const json::Value& item) -> HttpResponse {
     EmbeddingInput parsed;
     if (item.is_string()) {
@@ -316,6 +288,28 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
             return BadRequest("embedding requests accept at most 32 images",
                               "too_many_images");
           parsed.content.push_back({EmbeddingPart::Type::kImage, url->str()});
+        } else if (type == "input_video") {
+          const auto* video = part.find("input_video");
+          if (part.size() != 2 || !video || !video->is_object())
+            return BadRequest("video parts require an 'input_video' object",
+                              "invalid_parameter_type");
+          for (const auto& [key, value] : video->members()) {
+            if ((key != "data" && key != "url") || !value.is_string())
+              return BadRequest(
+                  "input_video accepts string data and url fields",
+                  "invalid_parameter_type");
+          }
+          const auto* source = video->find("data");
+          if (!source)
+            source = video->find("url");
+          if (!source || source->str().empty())
+            return BadRequest("input_video requires nonempty data or url",
+                              "invalid_parameter_type");
+          if (++video_count > EmbeddingService::kMaxVideos)
+            return BadRequest("embedding requests accept at most 32 videos",
+                              "too_many_videos");
+          parsed.content.push_back(
+              {EmbeddingPart::Type::kVideo, source->str()});
         } else if (type == "input_audio") {
           const auto* audio = part.find("input_audio");
           if (part.size() != 2 || !audio || !audio->is_object())
@@ -456,6 +450,53 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
   }
 
   EmbeddingRequestOptions options;
+  if (const auto* video = Optional(root, "video_options")) {
+    if (!video->is_object())
+      return BadRequest("video_options must be an object",
+                        "invalid_parameter_type");
+    for (const auto& [key, value] : video->members()) {
+      if (key == "fps") {
+        if (!value.is_number() || !std::isfinite(value.as_double()) ||
+            value.as_double() <= 0 || value.as_double() > 120)
+          return BadRequest("video fps must be in (0, 120]",
+                            "invalid_video_options");
+        options.video.fps = value.as_double();
+      } else if (key == "max_frames") {
+        const auto n = value.as_size(0);
+        if (!value.is_number() || n < 1 || n > 32 ||
+            value.as_double() != static_cast<double>(n))
+          return BadRequest("video max_frames must be an integer in [1, 32]",
+                            "invalid_video_options");
+        options.video.max_frames = n;
+      } else if (key == "add_timestamps") {
+        if (!value.is_bool())
+          return BadRequest("add_timestamps must be boolean",
+                            "invalid_video_options");
+        options.video.timestamps = value.as_bool();
+      } else if (key == "overflow_strategy") {
+        if (!value.is_string() ||
+            (value.str() != "uniform" && value.str() != "truncate"))
+          return BadRequest(
+              "video overflow_strategy must be uniform or truncate",
+              "invalid_video_options");
+        options.video.truncate_overflow = value.str() == "truncate";
+      } else if (key == "max_soft_tokens") {
+        const auto budget = value.as_size(0);
+        if (!value.is_number() ||
+            value.as_double() != static_cast<double>(budget) ||
+            !(budget == 70 || budget == 140 || budget == 280 || budget == 560 ||
+              budget == 1120))
+          return BadRequest(
+              "video max_soft_tokens must be one of 70, 140, 280, 560, or "
+              "1120",
+              "invalid_video_options");
+        options.video.max_soft_tokens = static_cast<std::uint32_t>(budget);
+      } else
+        return BadRequest("unsupported video option: " + key,
+                          "invalid_video_options");
+    }
+  }
+
   if (const json::Value* truncate = Optional(root, "truncate");
       truncate != nullptr) {
     if (!truncate->is_bool()) {
@@ -463,6 +504,31 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
                         "invalid_parameter_type");
     }
     options.truncate = truncate->as_bool();
+  }
+
+  // vLLM's per-request processor options. Only the image budget is supported.
+  if (const json::Value* kwargs = Optional(root, "mm_processor_kwargs");
+      kwargs != nullptr) {
+    if (!kwargs->is_object()) {
+      return BadRequest("'mm_processor_kwargs' must be an object",
+                        "invalid_parameter_type");
+    }
+    for (const auto& [key, value] : kwargs->members()) {
+      if (key != "max_soft_tokens") {
+        return BadRequest("unsupported mm_processor_kwargs key '" + key +
+                              "'; only 'max_soft_tokens' is supported",
+                          "invalid_mm_processor_kwargs");
+      }
+      const auto budget = value.as_size(0);
+      if (budget > kMaxImageSoftTokens ||
+          !(budget == 70 || budget == 140 || budget == 280 || budget == 560 ||
+            budget == 1120)) {
+        return BadRequest(
+            "'max_soft_tokens' must be one of 70, 140, 280, 560, or 1120",
+            "invalid_mm_processor_kwargs");
+      }
+      options.image_soft_tokens = static_cast<std::uint32_t>(budget);
+    }
   }
 
   EmbeddingBatch batch;
@@ -479,6 +545,8 @@ HttpResponse Embed(const HttpRequest& request, EmbeddingService& service,
                             std::to_string(EmbeddingService::kMaxInputTokens) +
                             "-token context window",
                         "context_length_exceeded");
+    case EmbeddingStatus::kInvalidVideoInput:
+      return BadRequest(error, "invalid_video_input");
     case EmbeddingStatus::kInvalidAudioInput:
       return BadRequest(error, "invalid_audio_input");
     case EmbeddingStatus::kInvalidInput:

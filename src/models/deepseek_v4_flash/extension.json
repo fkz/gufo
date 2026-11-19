@@ -1,0 +1,153 @@
+{
+  "schema": 1,
+  "name": "deepseek_v4_flash",
+  "version": "0.1.0",
+  "api_version": ">= 0.3.0",
+  "entry": "deepseek_v4_flash_register",
+  "registration_target": "gufo_deepseek_v4_flash",
+  "depends": [],
+  "platforms": [
+    "linux",
+    "windows"
+  ],
+  "providers": [
+    {
+      "id": "deepseek4",
+      "capability": "text_generation",
+      "keys": [
+        "gguf:deepseek4"
+      ],
+      "model_ids": [
+        "deepseek4"
+      ],
+      "speculative": [
+        "dspark"
+      ],
+      "target": "gufo_deepseek_v4_flash_hip",
+      "entry": "deepseek_v4_flash_provider_register",
+      "serving": {
+        "draft_options": {
+          "dspark": "--dspark-model"
+        }
+      }
+    }
+  ],
+  "models": [
+    {
+      "id": "deepseek4",
+      "provider": "deepseek4",
+      "license": "mit",
+      "description": "DeepSeek V4 Flash, IQ2XXS GGUF",
+      "components": [
+        {
+          "role": "weights",
+          "option": "--model",
+          "install": "required",
+          "source": {
+            "hf": "antirez/deepseek-v4-gguf",
+            "revision": "1cd7b564460821938add0475a60b942c409295e0"
+          },
+          "include": [
+            "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+          ]
+        },
+        {
+          "role": "dspark",
+          "option": "--dspark-model",
+          "install": "default",
+          "source": {
+            "hf": "antirez/deepseek-v4-gguf",
+            "revision": "e7f04037032990db0346398d249baf9fb9df1ccc"
+          },
+          "include": [
+            "DeepSeek-V4-Flash-DSpark-support-0731.gguf"
+          ]
+        }
+      ]
+    }
+  ],
+  "options": [
+    {
+      "name": "--dspark-model",
+      "type": "path",
+      "commands": [
+        "serve",
+        "bench",
+        "prompt"
+      ],
+      "providers": [
+        "deepseek4"
+      ],
+      "help": "DSpark draft model path for speculative decoding"
+    }
+  ],
+  "targets": {
+    "gufo_deepseek_v4_flash": {
+      "requires": []
+    },
+    "gufo_deepseek_v4_flash_hip": {
+      "requires": [
+        "hip"
+      ]
+    }
+  },
+  "licenses": [
+    "src/models/deepseek_v4_flash/LICENSE.ds4"
+  ],
+  "production_paths": {
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*",
+      "models.lock.json"
+    ],
+    "exclude": [
+      "tests/",
+      "functional/",
+      "tools/",
+      "fixtures/"
+    ]
+  },
+  "vendored_paths": [
+    "src/models/deepseek_v4_flash/runtime/",
+    "src/models/deepseek_v4_flash/kernels/rocm/"
+  ],
+  "docs": {
+    "title": "DeepSeek V4 Flash",
+    "inputs": "Flash 0731 mixed IQ2/Q2/Q8 GGUF; text",
+    "guide": "docs/models/deepseek-v4-flash.md"
+  },
+  "tests": [
+    {
+      "target": "deepseek_v4_flash_continuation_identity_test",
+      "ctest": "deepseek_v4_flash_continuation_identity_test",
+      "check_pr": true,
+      "windows_build": true
+    },
+    {
+      "target": "ds4_sampling_test",
+      "ctest": "ds4\\.sampling",
+      "check_pr": true,
+      "windows_build": true
+    },
+    {
+      "target": "ds4_chat_template_test",
+      "ctest": "ds4\\.template",
+      "check_pr": true,
+      "windows_build": true
+    },
+    {
+      "target": "ds4_cli_test",
+      "ctest": "ds4\\.cli",
+      "check_pr": true,
+      "windows_build": true
+    }
+  ],
+  "test_labels": [
+    "deepseek4"
+  ],
+  "fixtures": "tests/models/deepseek_v4_flash/fixtures/",
+  "functional": "functional/"
+}

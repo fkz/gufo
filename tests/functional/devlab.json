@@ -1,18 +1,17 @@
 {
   "schema": 1,
-  "disabled": {
-  "deepseek4": "Temporarily disabled: its 81 GiB weights and 36-suite PR set make the Devlab run too long to finish within a PR; re-enable by removing this entry"
- },
- "representatives": {
+  "disabled": {},
+  "representatives": {
     "llm": "flash-next-q4",
     "embedding": "embedding-gemma2",
     "asr": "qwen3-asr",
-    "tts": "qwen3-tts-base"
+    "tts": "qwen3-tts-base",
+    "image": "qwen-image-turbo"
   },
   "assets": {
     "flash-next": {
       "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
-      "revision": "38bb39ee97821de2c9009abb7e93950eec396e66",
+      "revision": "d96201194f103c906994f283f504209dc8d2a10c",
       "patterns": [
         "UD-Q4_K_XL/*.gguf",
         "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
@@ -29,7 +28,7 @@
     },
     "qwen27": {
       "repo": "unsloth/Qwen3.8-27B-GGUF",
-      "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+      "revision": "ce331efc48d5722b4b8041f72793e530eae18d9b",
       "patterns": [
         "Qwen3.8-27B-UD-Q4_K_XL.gguf",
         "mmproj-BF16.gguf"
@@ -156,6 +155,41 @@
         "speech_tokenizer/config.json",
         "speech_tokenizer/model.safetensors"
       ]
+    },
+    "image-turbo": {
+      "repo": "Qwen/Qwen-Image-2.1-Turbo",
+      "revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+      "patterns": [
+        "*.json",
+        "*.safetensors",
+        "*.jinja",
+        "LICENSE",
+        "README.md"
+      ],
+      "required": [
+        "model_index.json",
+        "transformer/diffusion_pytorch_model.safetensors.index.json",
+        "text_encoder/config.json",
+        "vae/config.json"
+      ]
+    },
+    "image": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "revision": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+      "patterns": [
+        "*.json",
+        "*.safetensors",
+        "*.txt",
+        "*.jinja",
+        "LICENSE",
+        "README.md"
+      ],
+      "required": [
+        "model_index.json",
+        "transformer/diffusion_pytorch_model.safetensors.index.json",
+        "text_encoder/model.safetensors.index.json",
+        "vae/diffusion_pytorch_model.safetensors"
+      ]
     }
   },
   "models": {
@@ -181,7 +215,31 @@
       "draft": "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
       "draft_option": "--dflash-model",
       "mode": "dflash2",
-      "sampling": "qwen38"
+      "sampling": "qwen38",
+      "cache_disk_bytes": 25769803776,
+      "suites": [
+        "logprobs",
+        "discovery",
+        "stops",
+        "conversation",
+        "image-inputs",
+        "structured",
+        "tool-streaming",
+        "tools",
+        "sampling-defaults",
+        "batch",
+        "long-context",
+        "state-edges",
+        "prefill-scheduling",
+        "cache-edits",
+        "cache-growth",
+        "cache-depth",
+        "cache-rotation",
+        "cache-concurrency",
+        "cache-shared-prefix",
+        "cache-bridge",
+        "cache"
+      ]
     },
     "deepseek4": {
       "title": "DeepSeek V4 Flash",
@@ -192,7 +250,49 @@
       "draft": "DeepSeek-V4-Flash-DSpark-support-0731.gguf",
       "draft_option": "--dspark-model",
       "mode": "dspark",
-      "sampling": "deepseek4"
+      "sampling": "deepseek4",
+      "ctest": {
+        "labels": [
+          "ds4"
+        ],
+        "rules": [
+          "private-deepseek",
+          "gpu-test-bundles"
+        ],
+        "environment": {
+          "GUFO_DEEPSEEK_V4_FLASH_MODEL": "target",
+          "GUFO_DEEPSEEK_V4_FLASH_DSPARK_MODEL": "draft"
+        }
+      },
+      "settings": {
+        "cache-pressure": {
+          "cache_ram_bytes": 1073741824
+        }
+      },
+      "suites": [
+        "logprobs",
+        "discovery",
+        "messages-image-counts",
+        "responses",
+        "stops",
+        "conversation",
+        "structured",
+        "tool-streaming",
+        "reasoning-separator",
+        "reasoning-budget",
+        "tools",
+        "tool-native-schemas",
+        "sampling-defaults",
+        "batch",
+        "state-edges",
+        "prefill-scheduling",
+        "cache-edits",
+        "cache-depth",
+        "cache-bridge",
+        "system-injection",
+        "cache"
+      ],
+      "max_jobs": 1
     },
     "embedding-gemma2": {
       "title": "EmbeddingGemma 2",
@@ -226,6 +326,40 @@
       "asset": "tts-design",
       "service": "tts",
       "variant": "design"
+    },
+    "qwen-image-turbo": {
+      "title": "Qwen-Image-2.1-Turbo",
+      "category": "image",
+      "asset": "image-turbo",
+      "service": "image"
+    },
+    "qwen-image": {
+      "title": "Qwen-Image-2.1",
+      "category": "image",
+      "asset": "image",
+      "service": "image"
+    },
+    "embedding-gemma2-npu": {
+      "title": "EmbeddingGemma 2 NPU",
+      "category": "embedding",
+      "asset": "embedding",
+      "service": "embedding",
+      "npu": true
+    },
+    "qwen3-asr-npu": {
+      "title": "Qwen3-ASR NPU",
+      "category": "asr",
+      "asset": "asr",
+      "service": "asr",
+      "npu": true
+    },
+    "qwen3-tts-custom-npu": {
+      "title": "Qwen3-TTS custom NPU",
+      "category": "tts",
+      "asset": "tts-custom",
+      "service": "tts",
+      "variant": "custom",
+      "npu": true
     }
   },
   "rules": [
@@ -247,13 +381,10 @@
       "id": "outside-current-scope",
       "priority": 20,
       "paths": [
-        "src/models/qwen_image_21/**",
         "src/models/minimax_h3/**",
-        "tests/models/qwen_image_21/**",
         "tests/models/minimax_h3*",
         "tools/h3/**",
         "tools/gufo/h3*",
-        "tools/models/qwen_image_21/**",
         "tests/cli/video*"
       ],
       "owners": []
@@ -263,8 +394,10 @@
       "priority": 20,
       "paths": [
         "src/models/qwen/**",
+        "src/families/qwen/**",
         "tests/models/qwen/**",
-        "tests/models/qwen27b/**"
+        "tests/models/qwen27b/**",
+        "tests/families/qwen/**"
       ],
       "owners": [
         "qwen27-q4"
@@ -305,7 +438,8 @@
         "tests/functional/embedding*"
       ],
       "owners": [
-        "embedding"
+        "embedding",
+        "embedding-gemma2-npu"
       ]
     },
     {
@@ -319,7 +453,8 @@
         "tests/functional/asr_service.py"
       ],
       "owners": [
-        "asr"
+        "asr",
+        "qwen3-asr-npu"
       ]
     },
     {
@@ -333,7 +468,22 @@
         "tests/functional/tts_service.py"
       ],
       "owners": [
-        "tts"
+        "tts",
+        "qwen3-tts-custom-npu"
+      ]
+    },
+    {
+      "id": "image",
+      "priority": 20,
+      "paths": [
+        "src/models/qwen_image_21/**",
+        "tests/models/qwen_image_21/**",
+        "tools/models/qwen_image_21/**",
+        "src/cli/serve/image*",
+        "tests/functional/image_service.py"
+      ],
+      "owners": [
+        "image"
       ]
     },
     {
@@ -347,7 +497,26 @@
       ],
       "owners": [
         "asr",
-        "tts"
+        "tts",
+        "qwen3-asr-npu",
+        "qwen3-tts-custom-npu"
+      ]
+    },
+    {
+      "id": "npu",
+      "priority": 20,
+      "owners": [
+        "embedding-gemma2-npu",
+        "qwen3-asr-npu",
+        "qwen3-tts-custom-npu"
+      ],
+      "paths": [
+        "src/core/npu/**",
+        "include/gufo/ext/experimental/npu.hpp",
+        "cmake/GufoNpuDesigns.cmake",
+        ".devops/nix/xrt/**",
+        ".devops/nix/iron/**",
+        "tests/core/npu*"
       ]
     },
     {
@@ -361,17 +530,21 @@
       "owners": [
         "embedding",
         "asr",
-        "tts"
+        "tts",
+        "image",
+        "embedding-gemma2-npu",
+        "qwen3-asr-npu",
+        "qwen3-tts-custom-npu"
       ]
     },
     {
       "id": "shared-qwen",
       "priority": 30,
       "paths": [
-        "src/models/qwen/chat_template.*",
-        "src/models/qwen/tokenizer.*",
-        "src/models/qwen/control_tokens.hpp",
-        "src/models/qwen/vision/**"
+        "src/families/qwen/text/chat_template.*",
+        "src/families/qwen/text/tokenizer.*",
+        "src/families/qwen/control_tokens/control_tokens.hpp",
+        "src/families/qwen/vision/**"
       ],
       "owners": [
         "llm"
@@ -424,7 +597,6 @@
         "tests/cli/arg_parser_test.cpp",
         "tests/cli/bench_test.cpp",
         "tests/cli/component_text_cache_test.cpp",
-        "tests/cli/continuation_disk_store_test.cpp",
         "tests/cli/http_server_signals_test.cpp",
         "tests/cli/http_server_test.cpp",
         "tests/cli/http_server_test_support.hpp",
@@ -462,7 +634,8 @@
         "llm",
         "embedding",
         "asr",
-        "tts"
+        "tts",
+        "image"
       ]
     },
     {
@@ -473,13 +646,30 @@
         "tests/functional/service_phases.py",
         "tests/functional/requirements.txt",
         "tools/ci/linux_artifact.py",
-        "tools/ci/devlab_artifact.py"
+        "tools/ci/devlab_artifact.py",
+        "tools/ci/linux-checked.nix"
       ],
       "owners": [
         "llm",
         "embedding",
         "asr",
-        "tts"
+        "tts",
+        "image",
+        "embedding-gemma2-npu",
+        "qwen3-asr-npu",
+        "qwen3-tts-custom-npu"
+      ]
+    },
+    {
+      "id": "gpu-test-bundles",
+      "priority": 30,
+      "paths": [
+        "tools/ci/ctest_bundle.py",
+        "tests/support/source_path.hpp",
+        "tests/functional/devlab_run.py"
+      ],
+      "owners": [
+        "deepseek4"
       ]
     }
   ]

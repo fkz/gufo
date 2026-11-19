@@ -2,10 +2,12 @@
 """Pinned Devlab model assets and production commands; downloads are plan-scoped."""
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path, PurePosixPath
 import re
 import time
+import traceback
 
 HERE = Path(__file__).resolve().parent
 REGISTRY = HERE / 'devlab.json'
@@ -42,6 +44,17 @@ def asset_keys(plan, data):
     return sorted(keys)
 
 
+def allow_large_http_downloads():
+    from huggingface_hub import constants
+    # The runner's Hugging Face mirror and Xet settings are not visible in the job log.
+    xet = importlib.util.find_spec('hf_xet') is not None and not constants.HF_HUB_DISABLE_XET
+    route = f'Hub endpoint {constants.ENDPOINT}; Xet {"enabled" if xet else "disabled"}'
+    print(route, flush=True)
+    # Without Xet headers or hf_xet, files over 50 GB (DeepSeek V4 Flash is 86.7 GB) come over HTTP.
+    constants.MAX_HTTP_DOWNLOAD_SIZE = 1 << 40
+    return route
+
+
 def download(plan, cache, data):
     from huggingface_hub import snapshot_download
     paths = {}
@@ -51,7 +64,7 @@ def download(plan, cache, data):
         print('Download', key, asset['revision'], 'to', destination, flush=True)
         existing = sum((destination / name).is_file() for name in asset['required'])
         print(f'{key}: {existing}/{len(asset["required"])} required files already present', flush=True)
-        started = time.monotonic()
+        started = time.perf_counter()
         for attempt in range(3):
             try:
                 snapshot_download(repo_id=asset['repo'], revision=asset['revision'],
@@ -67,7 +80,7 @@ def download(plan, cache, data):
             if not path.is_file() or not path.stat().st_size:
                 raise FileNotFoundError(path)
         paths[key] = str(destination.resolve())
-        print(f'{key}: ready in {time.monotonic() - started:.1f} s', flush=True)
+        print(f'{key}: ready in {time.perf_counter() - started:.1f} s', flush=True)
     return paths
 
 
@@ -92,6 +105,8 @@ def service_command(model_id, binary, assets, audio_root, public_model):
     if model.get('variant') == 'base':
         command += ['--voice', f'narrator={audio_root / "clear-english-voice.wav"}',
                     '--voice-text', f'narrator={audio_root / "clear-english-voice.txt"}']
+    if model.get('npu'):
+        command += ['--npu']
     return command
 
 
@@ -100,8 +115,20 @@ def main():
     parser.add_argument('--plan', type=Path, required=True)
     parser.add_argument('--cache', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--shard', help="Fetch only this shard's model assets")
     args = parser.parse_args()
-    paths = download(json.loads(args.plan.read_text()), args.cache.resolve(), registry())
+    plan = json.loads(args.plan.read_text())
+    if args.shard:
+        shard = next(row for row in plan['shards'] if row['id'] == args.shard)
+        models = {part['model'] for part in shard['parts']}
+        plan = {**plan, 'models': [row for row in plan['models'] if row['id'] in models]}
+    route = allow_large_http_downloads()
+    try:
+        paths = download(plan, args.cache.resolve(), registry())
+    except Exception:
+        # The workflow shows only the log's tail; repeat the route after the traceback.
+        traceback.print_exc()
+        raise SystemExit('Download failed; ' + route)
     args.output.write_text(json.dumps(paths, indent=2) + '\n')
 
 

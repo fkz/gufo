@@ -34,7 +34,7 @@ def main():
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if len(command) < 3 or command[1] != "serve" or "llm" not in command:
         parser.error("pass a production gufo serve llm command after --")
-    for flag in ("--host", "--port", "--api-key", "--cache-disk",
+    for flag in ("--host", "--port", "--cache-disk",
                  "--cache-disk-bytes", "--cache-disk-staging-bytes"):
         if option(command, flag) is not None:
             parser.error(f"the runner owns {flag}; omit it")
@@ -90,11 +90,11 @@ def main():
         stage_report = {"command": launch, "requests": {}, "status": "running"}
         report["stages"][name] = stage_report
         write_json(report_path, report)
-        started = time.monotonic()
+        started = time.perf_counter()
         try:
             with server(launch, stage_path / "server.log",
                         args.startup_timeout, environment):
-                stage_report["startup_ms"] = (time.monotonic() - started) * 1000
+                stage_report["startup_ms"] = (time.perf_counter() - started) * 1000
                 log = (stage_path / "server.log").read_text()
                 assert "schema=component-cache-v1 event=configured" in log, (
                     "requires the loaded Qwen component cache")

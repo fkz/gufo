@@ -14,8 +14,8 @@
 #include <optional>
 #include <utility>
 
+#include "src/families/qwen/control_tokens/control_tokens.hpp"
 #include "src/models/minimax_h3/json.hpp"
-#include "src/models/qwen/control_tokens.hpp"
 
 namespace gufo::minimax_h3 {
 namespace {
@@ -528,6 +528,18 @@ bool Tokenizer::ApplyBpe(std::string_view piece,
       return false;
     }
     ids->push_back(found->second);
+  }
+  return true;
+}
+
+bool Tokenizer::AddedTokenId(std::string_view content,
+                             std::uint32_t* id) const {
+  const auto found = added_tokens_.find(std::string(content));
+  if (found == added_tokens_.end()) {
+    return false;
+  }
+  if (id != nullptr) {
+    *id = found->second;
   }
   return true;
 }

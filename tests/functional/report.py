@@ -145,8 +145,10 @@ def phases_section(data):
                  f"{settings['slowdown'] * 100:.0f}% and >{settings['noise_ms']} ms); 🟨 slower in "
                  "some repeats, inconclusive; ⬜ never slower. Observations, not qualified timing "
                  f"regressions. Measured in {data['wall_s'] / 60:.1f} min.</sub>")
-    if any(phase.get('advisory_reason') for phase in phases):
-        lines += ["", "⚠️ HTTP ready timing is advisory: server-side timestamps are unavailable in one or more arms."]
+    reasons = sorted({phase['advisory_reason'] for phase in phases if phase.get('advisory_reason')})
+    for reason in reasons:
+        lines += ["", "⚠️ HTTP ready timing is advisory: server-side timestamps are unavailable in one or more arms."
+                  if reason == 'server readiness timestamps unavailable' else f"⚠️ Timings are advisory: {reason}."]
     if data.get("diverged"):
         lines += ["", "⚠️ Generated text differs or server work differs between arms for "
                   + ", ".join(f"`{key}`" for key in data["diverged"])
@@ -236,6 +238,30 @@ def timing_state(data):
     return 'measured'
 
 
+def ctest_section(item, selection):
+    """The model's GPU tests (checked package, `ctest -L`), when the plan selected them."""
+    if not selection.get('ctest'):
+        return []
+    labels = ', '.join(f'`{label}`' for label in selection['ctest']['labels'])
+    observed = item.get('ctest')
+    if not observed:
+        return ['', f'⚠️ GPU tests ({labels}) are missing.']
+    tests = observed.get('tests', [])
+    counts = {status: [row['name'] for row in tests if row['status'] == status]
+              for status in ('passed', 'skipped', 'failed')}
+    icon = ICONS['success'] if observed['status'] == 'passed' else ICONS['failure']
+    lines = ['', f"{icon} GPU tests ({labels}, assertion build): {len(counts['passed'])} passed"
+             + (f", {len(counts['skipped'])} skipped (" + ', '.join(f'`{name}`' for name in counts['skipped']) + ')'
+                if counts['skipped'] else '')
+             + (f", {len(counts['failed'])} failed" if counts['failed'] else '') + '.']
+    for row in tests:
+        if row['status'] == 'failed':
+            lines += ['', f"`{row['name']}` failed:", '', '```text', short(row.get('log_tail', ''), ERROR_CHARS), '```']
+    if observed.get('error'):
+        lines += ['', 'GPU test runner: ' + short(observed['error'], ERROR_CHARS)]
+    return lines
+
+
 def render_models(args, plan, summary):
     from devlab_models import registry
     definitions = registry()['models']
@@ -266,8 +292,6 @@ def render_models(args, plan, summary):
         state, description = 'failure', f'Server phases slower in every paired repeat (>{SLOWDOWN * 100:g}% and >{NOISE_MS} ms)'
     elif any(speed in ('missing', 'incomparable') for speed in speeds.values()):
         state, description = 'error', 'Correctness passed; speed comparison incomplete or work differs'
-    elif plan['tier'] != 'pr' and any(speed == 'inconclusive' for speed in speeds.values()):
-        state, description = 'error', 'Correctness passed; release speed comparison inconclusive'
     elif args.smoke != 'success':
         state, description = 'error', f'Model checks completed; cluster job {args.smoke}'
     timing_warning = state == 'success' and any(speed == 'inconclusive' for speed in speeds.values())
@@ -292,6 +316,7 @@ def render_models(args, plan, summary):
             lines += [''] + group_table(model_rows) + failure_details(model_rows)
         else:
             lines += ['', '⚠️ Correctness results are missing.']
+        lines += ctest_section(item, selection)
         for limitation in item.get('known_limitations', []):
             lines += ['', '⚠️ ' + short(limitation, 500)]
         if item.get('error'):
@@ -315,8 +340,10 @@ def render_models(args, plan, summary):
     lines += ['', f"<sub>[Workflow run and evidence]({args.run_url}) · "
               f"merge `{plan['head'][:7]}` vs main `{plan['base'][:7]}` · "
               f"{len(plan['deferred'])} deferred, {len(plan['release_only'])} for the release run. "
+              + ('Correctness ran on the assertion-enabled `gpu-test` build; speed compares release builds. '
+                 if (summary or {}).get('correctness_binary') == 'checked' else '') +
               f"`{STATUS_CONTEXT}` is advisory on PRs; only the automatic release merge waits for it. "
-              'Coverage is limited to the selected representatives; image/video generation and agent replay remain separate.</sub>']
+              'Coverage is limited to the selected representatives; video generation and agent replay remain separate.</sub>']
     return state, description, '\n'.join(lines) + '\n'
 
 

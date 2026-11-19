@@ -24,12 +24,49 @@
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
-#include "src/models/minimax_h3/sha256.hpp"
+#include "src/ext/video.hpp"
 
 namespace gufo::server {
 namespace {
+
+std::optional<int> ResolveDurationFrames(std::string_view seconds,
+                                         std::string* error = nullptr) {
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->resolve_duration_frames) {
+    return provider->resolve_duration_frames(seconds, error);
+  }
+  return std::nullopt;
+}
+
+bool ValidateGenerationParameters(const ext::VideoParameters& parameters,
+                                  std::string* error = nullptr) {
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->validate_parameters) {
+    return provider->validate_parameters(parameters, error);
+  }
+  return false;
+}
+
+std::string GenerationParametersJson(const ext::VideoParameters& parameters,
+                                     std::uint64_t seed,
+                                     std::string_view prompt_sha256) {
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->parameters_json) {
+    return provider->parameters_json(parameters, seed, prompt_sha256);
+  }
+  return "{}";
+}
+
+std::string GenerationTelemetryJson(const ext::VideoTelemetry& telemetry) {
+  const auto* provider = ext::FindVideoProvider("minimax-h3");
+  if (provider && provider->telemetry_json) {
+    return provider->telemetry_json(telemetry);
+  }
+  return "{}";
+}
 
 bool IsH3Model(std::string_view model) {
   return model == "minimax-h3" || model == "minimax-h3-exact" ||
@@ -50,7 +87,7 @@ bool ModelMatchesPreset(std::string_view model, std::string_view preset) {
 
 bool MatchesOutputContract(const VideoJobRequest& request) {
   const auto& parameters = request.parameters;
-  const auto frames = minimax_h3::ResolveDurationFrames(request.seconds);
+  const auto frames = ResolveDurationFrames(request.seconds);
   if (!frames || parameters.frames != *frames ||
       !ModelMatchesPreset(request.model, parameters.preset)) {
     return false;
@@ -200,9 +237,66 @@ bool WriteAtomic(const std::filesystem::path& path, std::string_view contents,
   return true;
 }
 
+// Persisted job.json schema. v2 (issue #177) adds an optional "keyframes"
+// provenance object; RecoverJobs() still accepts v1 so pre-keyframe completed
+// jobs resurrect unchanged.
+constexpr std::string_view kVideoJobSchema = "gufo.video-job.v2";
+constexpr std::string_view kLegacyVideoJobSchema = "gufo.video-job.v1";
+constexpr std::string_view kFirstFrameFileName = "first_frame.img";
+constexpr std::string_view kLastFrameFileName = "last_frame.img";
+
+/// Appends the job-directory keyframe provenance block to a JSON object
+/// (job.json and the parameters.json report share one shape).
+void AddKeyframeProvenance(json::Value& root,
+                           const VideoJobSnapshot& snapshot) {
+  if (snapshot.first_frame_sha256.empty() &&
+      snapshot.last_frame_sha256.empty()) {
+    return;
+  }
+  json::Value keyframes = json::Value::object();
+  if (!snapshot.first_frame_sha256.empty()) {
+    json::Value first = json::Value::object();
+    first["file"] = std::string(kFirstFrameFileName);
+    first["sha256"] = snapshot.first_frame_sha256;
+    keyframes["first_frame"] = std::move(first);
+  }
+  if (!snapshot.last_frame_sha256.empty()) {
+    json::Value last = json::Value::object();
+    last["file"] = std::string(kLastFrameFileName);
+    last["sha256"] = snapshot.last_frame_sha256;
+    keyframes["last_frame"] = std::move(last);
+  }
+  root["keyframes"] = std::move(keyframes);
+}
+
+/// Provider parameters report with the job's keyframe provenance merged in
+/// (issue #177). The integrator's `parameters_json` provider hook stays
+/// untouched; unknown provider payloads are passed through unmodified.
+std::string ParametersReportJson(const ext::VideoParameters& parameters,
+                                 std::uint64_t seed,
+                                 std::string_view prompt_sha256,
+                                 const VideoJobSnapshot& snapshot) {
+  const std::string base =
+      GenerationParametersJson(parameters, seed, prompt_sha256);
+  if (snapshot.first_frame_sha256.empty() &&
+      snapshot.last_frame_sha256.empty()) {
+    return base;
+  }
+  try {
+    json::Value root = json::parse(base);
+    if (!root.is_object()) {
+      return base;
+    }
+    AddKeyframeProvenance(root, snapshot);
+    return root.dump();
+  } catch (const std::exception&) {
+    return base;
+  }
+}
+
 std::string SnapshotJson(const VideoJobSnapshot& snapshot) {
   json::Value root = json::Value::object();
-  root["schema"] = "gufo.video-job.v1";
+  root["schema"] = std::string(kVideoJobSchema);
   root["id"] = snapshot.id;
   root["status"] = std::string(ToString(snapshot.status));
   root["progress"] = snapshot.progress;
@@ -221,6 +315,7 @@ std::string SnapshotJson(const VideoJobSnapshot& snapshot) {
   } else {
     root["error"] = json::Value();
   }
+  AddKeyframeProvenance(root, snapshot);
   return root.dump() + "\n";
 }
 
@@ -276,9 +371,14 @@ struct VideoJobService::Impl {
     VideoJobSnapshot snapshot;
     VideoJobRequest request;
     std::filesystem::path directory;
+    /// Staged keyframe anchors inside `directory` (issue #177); empty when
+    /// the job is text-only. They ride the directory's lifetime so DELETE,
+    /// cancellation, and TTL expiry reclaim uploaded imagery with the output.
+    std::filesystem::path first_frame_path;
+    std::filesystem::path last_frame_path;
     std::filesystem::path content_path;
     std::string media_type;
-    minimax_h3::CancellationToken cancellation;
+    std::atomic<bool> cancelled{false};
     bool deleted{false};
     std::string logged_phase;
     int logged_bucket{-1};
@@ -293,7 +393,25 @@ struct VideoJobService::Impl {
       options.now = UnixNow;
     }
     if (!options.runner) {
-      options.runner = minimax_h3::GenerateTextVideo;
+      const auto* provider = ext::FindVideoProvider("minimax-h3");
+      if (provider && provider->create) {
+        std::string create_err;
+        auto video_runner =
+            provider->create(options.model_root.string(), &create_err);
+        if (video_runner) {
+          std::shared_ptr<ext::VideoRunner> shared_runner =
+              std::move(video_runner);
+          options.runner = [shared_runner](const ext::VideoRequest& req,
+                                           const ext::CancellationCheck& check,
+                                           ext::VideoProgress progress,
+                                           void* progress_opaque,
+                                           ext::VideoTelemetry* telem,
+                                           std::string* err) {
+            return shared_runner->Generate(req, check, progress,
+                                           progress_opaque, telem, err);
+          };
+        }
+      }
     }
     if (options.model_root.empty() || options.source_manifest.empty() ||
         options.storage_root.empty() || options.queue_capacity == 0 ||
@@ -310,11 +428,16 @@ struct VideoJobService::Impl {
     }
 #endif
     if (options.validate_model_inventory) {
-      std::string inspection_error;
-      if (!minimax_h3::ModelInventory::Inspect(
-               options.model_root, options.source_manifest, &inspection_error)
-               .has_value()) {
-        initialization_error = std::move(inspection_error);
+      const auto* provider = ext::FindVideoProvider("minimax-h3");
+      std::string resolve_error;
+      if (provider == nullptr ||
+          (provider->resolve &&
+           !provider->resolve(options.model_root.string(),
+                              options.source_manifest.string(),
+                              &resolve_error))) {
+        initialization_error = resolve_error.empty()
+                                   ? "MiniMax H3 model not resolved"
+                                   : std::move(resolve_error);
         return;
       }
     }
@@ -352,10 +475,10 @@ struct VideoJobService::Impl {
       {
         const std::lock_guard<std::mutex> lock(mutex);
         if (active != nullptr) {
-          active->cancellation.Cancel();
+          active->cancelled.store(true, std::memory_order_relaxed);
         }
         for (const auto& job : queue) {
-          job->cancellation.Cancel();
+          job->cancelled.store(true, std::memory_order_relaxed);
           WipeString(&job->request.prompt);
         }
       }
@@ -447,12 +570,14 @@ struct VideoJobService::Impl {
             expires_at > completed_at &&
             expires_at <=
                 static_cast<double>(std::numeric_limits<std::int64_t>::max());
-        if (value.member_str("schema") != "gufo.video-job.v1" ||
+        const std::string schema = value.member_str("schema");
+        // Accept v1 (pre-keyframe) and v2 (issue #177 provenance) snapshots.
+        if ((schema != std::string(kVideoJobSchema) &&
+             schema != std::string(kLegacyVideoJobSchema)) ||
             !IsVideoId(job->snapshot.id) || job->snapshot.id != directory_id ||
             !IsH3Model(job->snapshot.model) ||
-            !minimax_h3::ResolveDurationFrames(job->snapshot.seconds) ||
-            !valid_output || !valid_numbers ||
-            expires_at <= static_cast<double>(now_value) ||
+            !ResolveDurationFrames(job->snapshot.seconds) || !valid_output ||
+            !valid_numbers || expires_at <= static_cast<double>(now_value) ||
             value.member_str("status") != "completed") {
           std::filesystem::remove_all(entry.path(), filesystem_error);
           filesystem_error.clear();
@@ -462,6 +587,18 @@ struct VideoJobService::Impl {
         job->snapshot.created_at = static_cast<std::int64_t>(created_at);
         job->snapshot.completed_at = static_cast<std::int64_t>(completed_at);
         job->snapshot.expires_at = static_cast<std::int64_t>(expires_at);
+        // Optional v2 keyframe provenance; v1 documents simply carry none.
+        if (const json::Value* keyframes = value.find("keyframes");
+            keyframes != nullptr && keyframes->is_object()) {
+          if (const json::Value* first = keyframes->find("first_frame");
+              first != nullptr && first->is_object()) {
+            job->snapshot.first_frame_sha256 = first->member_str("sha256");
+          }
+          if (const json::Value* last = keyframes->find("last_frame");
+              last != nullptr && last->is_object()) {
+            job->snapshot.last_frame_sha256 = last->member_str("sha256");
+          }
+        }
         if (job->snapshot.output_format == "mp4") {
           job->content_path = entry.path() / "output.mp4";
           job->media_type = "video/mp4";
@@ -582,7 +719,7 @@ struct VideoJobService::Impl {
               " steps=" + std::to_string(job->request.parameters.evaluations) +
               " seed=" + std::to_string(job->request.seed) + " " +
               Logger::MemoryStatus());
-      minimax_h3::GenerationRequest generation{
+      ext::VideoRequest generation{
           .model_root = options.model_root,
           .source_manifest = options.source_manifest,
           .output_path = job->directory / "output.mp4",
@@ -593,6 +730,8 @@ struct VideoJobService::Impl {
           .prompt = {},
           .seed = job->request.seed,
           .parameters = job->request.parameters,
+          .first_frame_path = job->first_frame_path,
+          .last_frame_path = job->last_frame_path,
       };
       {
         // Delete can clear a queued/active prompt concurrently with admission.
@@ -600,15 +739,15 @@ struct VideoJobService::Impl {
         generation.prompt = std::move(job->request.prompt);
         WipeString(&job->request.prompt);
       }
-      const std::string prompt_hash = minimax_h3::Sha256(std::span(
-          reinterpret_cast<const unsigned char*>(generation.prompt.data()),
-          generation.prompt.size()));
+      const std::string prompt_hash =
+          crypto::Sha256Hex(std::span<const std::uint8_t>(
+              reinterpret_cast<const std::uint8_t*>(generation.prompt.data()),
+              generation.prompt.size()));
       std::string metadata_error;
-      if (!WriteAtomic(
-              job->directory / "parameters.json",
-              minimax_h3::GenerationParametersJson(
-                  job->request.parameters, job->request.seed, prompt_hash),
-              &metadata_error)) {
+      if (!WriteAtomic(job->directory / "parameters.json",
+                       GenerationParametersJson(job->request.parameters,
+                                                job->request.seed, prompt_hash),
+                       &metadata_error)) {
         WipeString(&generation.prompt);
         const std::lock_guard<std::mutex> lock(mutex);
         active.reset();
@@ -623,26 +762,29 @@ struct VideoJobService::Impl {
         continue;
       }
       ProgressContext progress{this, job};
-      minimax_h3::GenerationTelemetry telemetry;
+      ext::VideoTelemetry telemetry;
       std::string error;
       bool success = false;
       try {
-        success = options.runner(generation, &job->cancellation, Progress,
-                                 &progress, &telemetry, &error);
+        success = options.runner(
+            generation,
+            [&] { return job->cancelled.load(std::memory_order_relaxed); },
+            Progress, &progress, &telemetry, &error);
       } catch (const std::exception& exception) {
         error = exception.what();
       } catch (...) {
         error = "video generation backend failed unexpectedly";
       }
       WipeString(&generation.prompt);
-      if (!success && !job->cancellation.IsCancelled()) {
+      if (!success && !job->cancelled.load(std::memory_order_relaxed)) {
         Logger::Error("video", "job=" + job->snapshot.id +
                                    " event=backend_failed detail=" + error);
       }
 
       std::filesystem::path content_path;
       std::string media_type;
-      bool output_ready = success && !job->cancellation.IsCancelled();
+      bool output_ready =
+          success && !job->cancelled.load(std::memory_order_relaxed);
       if (output_ready && job->request.output_format == "mp4") {
         content_path = job->directory / "output.mp4";
         media_type = "video/mp4";
@@ -670,7 +812,7 @@ struct VideoJobService::Impl {
       if (output_ready) {
         std::string telemetry_error;
         if (!WriteAtomic(job->directory / "telemetry.json",
-                         minimax_h3::GenerationTelemetryJson(telemetry),
+                         GenerationTelemetryJson(telemetry),
                          &telemetry_error)) {
           output_ready = false;
           storage_failure = true;
@@ -691,7 +833,7 @@ struct VideoJobService::Impl {
           if (output_ready) {
             snapshot.status = VideoJobStatus::kCompleted;
             snapshot.progress = 100;
-          } else if (job->cancellation.IsCancelled()) {
+          } else if (job->cancelled.load(std::memory_order_relaxed)) {
             snapshot.status = VideoJobStatus::kCancelled;
             snapshot.error_code = "cancelled";
             snapshot.error_message = "video generation was cancelled";
@@ -774,6 +916,23 @@ std::string VideoJobService::initialization_error() const {
                           : impl_->initialization_error;
 }
 
+bool VideoJobService::serves_model(std::string_view name) const {
+  return IsH3Model(name) ||
+         std::find(impl_->options.model_aliases.begin(),
+                   impl_->options.model_aliases.end(),
+                   std::string(name)) != impl_->options.model_aliases.end();
+}
+
+std::string VideoJobService::normalize_model(std::string_view name) const {
+  if (IsH3Model(name))
+    return std::string(name);
+  return serves_model(name) ? "minimax-h3" : std::string(name);
+}
+
+const std::vector<std::string>& VideoJobService::model_aliases() const {
+  return impl_->options.model_aliases;
+}
+
 VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
   if (!ready()) {
     return {.result = VideoJobResult::kIoError,
@@ -783,7 +942,7 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
   if (!IsH3Model(request.model) || request.prompt.empty() ||
       request.prompt.find('\0') != std::string::npos ||
       (request.output_format != "mp4" && request.output_format != "ppm") ||
-      !minimax_h3::ValidateGenerationParameters(request.parameters, nullptr) ||
+      !ValidateGenerationParameters(request.parameters, nullptr) ||
       !MatchesOutputContract(request)) {
     return {.result = VideoJobResult::kInvalid,
             .job = std::nullopt,
@@ -837,6 +996,50 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
       return {.result = VideoJobResult::kInvalid,
               .job = std::nullopt,
               .error = "video job destination already exists"};
+    }
+    // Stage keyframe anchors inside the job directory (issue #177). Uploaded
+    // imagery rides the directory lifetime so DELETE and TTL expiry reclaim
+    // it with the outputs; the snapshot carries SHA-256 provenance written
+    // before Persist emits job.json.
+    const auto stage_keyframe = [&](const std::vector<std::uint8_t>& png,
+                                    std::string_view filename,
+                                    std::filesystem::path* destination,
+                                    std::string* sha256_out) {
+      if (png.empty()) {
+        return true;
+      }
+      *destination = job->directory / filename;
+      std::error_code filesystem_failure;
+      std::filesystem::create_directories(job->directory, filesystem_failure);
+      if (filesystem_failure) {
+        return false;
+      }
+      std::ofstream file(*destination, std::ios::binary | std::ios::trunc);
+      if (!file) {
+        return false;
+      }
+      file.write(reinterpret_cast<const char*>(png.data()),
+                 static_cast<std::streamsize>(png.size()));
+      file.close();
+      if (!file) {
+        return false;
+      }
+      *sha256_out = crypto::Sha256Hex(
+          std::span<const std::uint8_t>(png.data(), png.size()));
+      return true;
+    };
+    if (!stage_keyframe(request.first_frame_bytes, kFirstFrameFileName,
+                        &job->first_frame_path,
+                        &job->snapshot.first_frame_sha256) ||
+        !stage_keyframe(request.last_frame_bytes, kLastFrameFileName,
+                        &job->last_frame_path,
+                        &job->snapshot.last_frame_sha256)) {
+      std::error_code ignored;
+      std::filesystem::remove_all(job->directory, ignored);
+      WipeString(&job->request.prompt);
+      return {.result = VideoJobResult::kIoError,
+              .job = std::nullopt,
+              .error = "cannot stage keyframe anchors"};
     }
     impl_->jobs.emplace(job->snapshot.id, job);
     impl_->queue.push_back(job);
@@ -930,7 +1133,7 @@ VideoJobLookupResult VideoJobService::Delete(std::string_view id) {
     job = iterator->second;
     snapshot = job->snapshot;
     job->deleted = true;
-    job->cancellation.Cancel();
+    job->cancelled.store(true, std::memory_order_relaxed);
     WipeString(&job->request.prompt);
     was_active = impl_->active == job;
     std::erase(impl_->queue, job);

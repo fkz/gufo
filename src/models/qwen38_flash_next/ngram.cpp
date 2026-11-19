@@ -1,16 +1,21 @@
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
+#include "src/models/qwen38_flash_next/ngram_remainder.hpp"
+
+#if defined(__GNUC__) && defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 #include <algorithm>
 #include <bit>
 #include <cerrno>
 #include <cstring>
+#include <gufo/ext/experimental/ggml_dequant.hpp>
+#include <gufo/ext/platform/fs.hpp>
+#include <gufo/ext/platform/mapped_file.hpp>
 #include <limits>
 #include <stdexcept>
 #include <system_error>
-
-#include "src/core/platform/fs.hpp"
-#include "src/core/platform/mapped_file.hpp"
-#include "src/core/quant/ggml_dequant.hpp"
 
 namespace gufo::models::qwen38_flash_next {
 namespace {
@@ -24,6 +29,29 @@ constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
 constexpr std::size_t kCacheBytes = 128 * 1024 * 1024;
 
+#if defined(__GNUC__) && defined(__x86_64__)
+// bf16 -> f32 is a 16-bit shift of the raw bits, so the widening needs no
+// float conversions: zero-extend, shift, reinterpret each 16-lane group.
+__attribute__((target("avx512f"))) void DecodeBf16Avx512(
+    const std::uint8_t* src, float* dst, std::uint32_t dim) noexcept {
+  std::uint32_t i = 0;
+  for (; i + 16 <= dim; i += 16) {
+    const __m512i bits = _mm512_cvtepu16_epi32(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 2 * i)));
+    _mm512_storeu_ps(dst + i, _mm512_castsi512_ps(_mm512_slli_epi32(bits, 16)));
+  }
+  if (i < dim) {
+    for (; i < dim; ++i) {
+      std::uint16_t bits = 0;
+      std::memcpy(&bits, src + 2 * i, 2);
+      const std::uint32_t f = static_cast<std::uint32_t>(bits) << 16;
+      std::memcpy(dst + i, &f, sizeof(float));
+    }
+  }
+}
+
+#endif
+
 }  // namespace
 
 void HashNgramRows(const Config& c, NgramHistory& history,
@@ -32,6 +60,13 @@ void HashNgramRows(const Config& c, NgramHistory& history,
   const std::uint32_t n = c.ple_ngram_size;
   const std::int64_t eos = c.ple_eos_token;
   std::array<std::uint64_t, Config::kMaxPleNgram> ctx{};
+#if defined(__SIZEOF_INT128__)
+  // Cache by divisor value, so mutation or address reuse of Config is safe.
+  thread_local std::array<detail::HeadRemainder, Config::kMaxPleHeads>
+      remainders;
+  for (std::uint32_t h = 0; h < c.ple_heads; ++h)
+    remainders[h].SetDivisor(c.ple_head_vocab[h]);
+#endif
   for (std::size_t i = 0; i < tokens.size(); ++i) {
     // The token's own EOS does not cut its context, only an older one does.
     ctx[0] = static_cast<std::uint64_t>(tokens[i]);
@@ -50,8 +85,12 @@ void HashNgramRows(const Config& c, NgramHistory& history,
       const std::uint32_t base = (order - 2) * c.ple_heads_per_ngram;
       for (std::uint32_t g = 0; g < c.ple_heads_per_ngram; ++g) {
         const std::uint32_t h = base + g;
+#if defined(__SIZEOF_INT128__)
+        out[h] = remainders[h](mixed) + c.ple_head_offsets[h];
+#else
         out[h] = static_cast<std::uint32_t>(mixed % c.ple_head_vocab[h]) +
                  c.ple_head_offsets[h];
+#endif
       }
     }
     for (std::size_t s = history.prev.size(); s-- > 1;) {
@@ -80,10 +119,14 @@ std::unique_ptr<NgramTable> NgramTable::Open(
     platform::PlatformFile file, std::uint64_t file_offset, std::uint64_t rows,
     std::uint32_t row_dim, core::GgmlType type, std::string* error_msg) {
   std::unique_ptr<NgramTable> t(new NgramTable());
-  const std::size_t block = type == core::GgmlType::kIQ4_NL ? 32 : 1;
-  const std::size_t block_bytes = type == core::GgmlType::kIQ4_NL ? 18 : 2;
-  if ((type != core::GgmlType::kIQ4_NL && type != core::GgmlType::kBF16) ||
-      row_dim == 0 || row_dim % block != 0) {
+  const bool blocked =
+      type == core::GgmlType::kIQ4_NL || type == core::GgmlType::kQ8_0;
+  const std::size_t block = blocked ? 32 : 1;
+  const std::size_t block_bytes = type == core::GgmlType::kIQ4_NL ? 18
+                                  : type == core::GgmlType::kQ8_0 ? 34
+                                                                  : 2;
+  if ((!blocked && type != core::GgmlType::kBF16) || row_dim == 0 ||
+      row_dim % block != 0) {
     if (error_msg != nullptr) {
       *error_msg = "unsupported n-gram table format";
     }
@@ -120,7 +163,16 @@ std::unique_ptr<NgramTable> NgramTable::Open(
 void NgramTable::DecodeRow(const std::uint8_t* src, float* dst) const {
   if (type_ == core::GgmlType::kIQ4_NL) {
     gufo::quant::DequantizeIQ4_NL(src, dst, row_dim_);
+  } else if (type_ == core::GgmlType::kQ8_0) {
+    gufo::quant::DequantizeQ8_0(src, dst, row_dim_);
   } else {
+#if defined(__GNUC__) && defined(__x86_64__)
+    static const bool has_avx512f = __builtin_cpu_supports("avx512f");
+    if (has_avx512f) {
+      DecodeBf16Avx512(src, dst, row_dim_);
+      return;
+    }
+#endif
     for (std::uint32_t i = 0; i < row_dim_; ++i) {
       std::uint16_t bits = 0;
       std::memcpy(&bits, src + 2 * i, 2);

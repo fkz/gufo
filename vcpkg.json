@@ -9,8 +9,11 @@
     "libpng",
     "libjpeg-turbo",
     "libwebp",
-    "libsndfile",
-    "soxr",
+    "opus",
+    {"name": "ffmpeg", "default-features": false, "features": ["avcodec", "avformat", "swscale"]},
     "pkgconf"
+  ],
+  "overrides": [
+    {"name": "curl", "version": "8.23.0"}
   ]
 }

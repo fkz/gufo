@@ -50,6 +50,17 @@ with tempfile.TemporaryDirectory() as temporary:
         check(HipMemory.for_binary(link) is None, "unsupported wrapper has no HIP library")
         check(not ldd.called, "do not inspect shell scripts with ldd")
 
+with tempfile.TemporaryDirectory() as temporary:
+    directory = Path(temporary)
+    executable = directory / "gufo.exe"
+    executable.touch()
+    with patch("gufo.model_bench.servers.sys.platform", "win32"), \
+            patch("gufo.model_bench.servers.ctypes.CDLL"), \
+            patch("gufo.model_bench.servers.subprocess.run") as ldd:
+        (directory / "amdhip64_7.dll").touch()
+        check(HipMemory.for_binary(executable) is None, "no outside memory sampler under WDDM")
+        check(not ldd.called, "Windows resolution does not run ldd")
+
 
 GUFO_USAGE = {
     "prompt_tokens": 12,
@@ -407,30 +418,6 @@ request_with(overridden_benchmark,
              extra_body={"temperature": .7, "presence_penalty": .5, "top_k": 7})
 
 
-for api_key in ("", "benchmark-test-secret"):
-    with patch.dict(os.environ, {"OPENAI_API_KEY": api_key}):
-        expected = f"Bearer {api_key}" if api_key else None
-
-        def authenticated_completion(request, timeout):
-            check(request.get_header("Authorization") == expected,
-                  "generation uses the configured bearer credential")
-            return fake_urlopen(request, timeout)
-
-        observation = request_with(authenticated_completion)
-        if api_key:
-            check(api_key not in json.dumps(observation.public()),
-                  "credentials are not included in benchmark observations")
-
-        def authenticated_discovery(request, timeout):
-            check(request.get_header("Authorization") == expected,
-                  "model discovery uses the configured bearer credential")
-            return io.BytesIO(b'{"data":[{"id":"test-model"}]}')
-
-        with patch.object(serving_bench.urllib.request, "urlopen",
-                          authenticated_discovery):
-            check(serving_bench.discover_model("https://private.example", 5)
-                  == "test-model", "authenticated model discovery succeeds")
-
 
 plain = request_with(
     fake_urlopen_openai, endpoint_profile="openai", cache_prompt=False
@@ -527,6 +514,34 @@ check(
     "openai profile, cache flag, notes, and reference are recorded",
 )
 check(openai_report["warnings"] == [], "no spurious warnings without metrics")
+
+
+# The benchmark client keeps bearer support for authenticated endpoints even
+# though the Gufo server no longer has one.
+for api_key in ("", "benchmark-test-secret"):
+    with patch.dict(os.environ, {"OPENAI_API_KEY": api_key}):
+        expected = f"Bearer {api_key}" if api_key else None
+
+        def authenticated_completion(request, timeout):
+            check(request.get_header("Authorization") == expected,
+                  "generation uses the configured bearer credential")
+            return fake_urlopen(request, timeout)
+
+        observation = request_with(authenticated_completion)
+        if api_key:
+            check(api_key not in json.dumps(observation.public()),
+                  "credentials are not included in benchmark observations")
+
+        def authenticated_discovery(request, timeout):
+            check(request.get_header("Authorization") == expected,
+                  "model discovery uses the configured bearer credential")
+            return io.BytesIO(b'{"data":[{"id":"test-model"}]}')
+
+        with patch.object(serving_bench.urllib.request, "urlopen",
+                          authenticated_discovery):
+            check(serving_bench.discover_model("https://private.example", 5)
+                  == "test-model", "authenticated model discovery succeeds")
+
 with patch.object(serving_bench.urllib.request, "urlopen", fake_urlopen):
     try:
         serving_bench.run_corpus_benchmark(
@@ -978,6 +993,33 @@ with tempfile.TemporaryDirectory() as directory:
     check(session.store.call_args.args[1]["mode"] == "mtp",
           "loading records its actual speculative execution mode")
     session.reference_version.assert_called_once_with("mtp")
+
+# A model without a speculative mode omits the block: its loading table
+# loads autoregressively and its cards still render.
+with tempfile.TemporaryDirectory() as directory:
+    config = load_config(ROOT, "qwen3.8-flash-next")
+    del config.data["speculative"]
+    config.artifacts_override = Path(directory)
+    config.files = {"gguf": {"default": Path(__file__)}}
+    session = Session(
+        config, "gufo", gufo_binary=Path("gufo"), reference_binary="llama-server",
+        source={"revision": "a" * 40, "dirty": False}, fingerprint={},
+        log_dir=Path(directory), document="", todo_only=False,
+    )
+    server = MagicMock(ready_seconds=0.25)
+    server.command = ["gufo"]
+    session.server = MagicMock(return_value=server)
+    session.reference_version = MagicMock(return_value=None)
+    session.store = MagicMock()
+    with patch("gufo.model_bench.llm.drop_file_cache"), \
+            patch("gufo.model_bench.llm.wait_process_exit"), \
+            patch("sys.stdout", new=io.StringIO()):
+        run_loading(session, config.table("loading"))
+    check(session.server.call_args.kwargs["mode"] == "ar"
+          and session.store.call_args.args[1]["mode"] == "ar",
+          "loading without a speculative block runs autoregressively")
+    for table_id in ("single-ar", "multi-ar", "loading", "memory"):
+        layout_for(config, config.table(table_id))
 
 # Single-user d0 and concurrency C1 must send the same pp2048 prompt.
 with tempfile.TemporaryDirectory() as directory:

@@ -4,50 +4,40 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <gufo/ext/image.hpp>
 #include <memory>
+#include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace gufo::models::qwen_image_21 {
 
-struct Image {
-  int width{0};
-  int height{0};
-  std::vector<std::uint8_t> rgba;
-};
+using Image = ext::ImageBuffer;
+using Request = ext::ImageRequest;
+using Metrics = ext::ImageMetrics;
+using Result = ext::ImageResult;
+using CancellationCheck = ext::CancellationCheck;
+using Lora = ext::ImageLora;
+using LoraInfo = ext::ImageLoraInfo;
 
 Image DecodeImage(std::span<const std::uint8_t> bytes);
 std::vector<std::uint8_t> EncodePng(const Image& image);
 Image ResizeImage(const Image& image, int width, int height);
 /// Keep edit noise independent of the noise that generated its references.
 /// Supply the canonical resized RGBA references; generation retains its seed.
+/// Image to image additionally binds the start image (already resized to the
+/// output size), so its noise never replays the noise that generated it.
 std::uint64_t InitialNoiseSeed(std::uint64_t seed,
-                               std::span<const Image> images);
+                               std::span<const Image> images,
+                               const Image* init_image = nullptr);
 
-struct Request {
-  std::string prompt;
-  std::vector<Image> images;
-  int width{1024};
-  int height{1024};
-  int steps{40};
-  std::uint64_t seed{0};
-};
-
-struct Metrics {
-  double prompt_ms{0};
-  double denoise_ms{0};
-  double vae_ms{0};
-  double total_ms{0};
-  std::size_t resident_weight_bytes{0};
-};
-
-struct Result {
-  Image image;
-  Metrics metrics;
-};
-
-using CancellationCheck = std::function<bool()>;
+/// The request does not fit into free GPU memory (checked before the
+/// condition caches fill, and per step for large requests). The model stays
+/// usable; the host answers 503.
+using InsufficientMemory = ext::ImageResourceError;
 /// Development observer; tensors are FP32 views of the actual BF16 boundary.
 struct Observer {
   std::function<void(std::string_view, std::span<const float>, int, int)> write;
@@ -60,7 +50,40 @@ struct Observer {
 };
 
 void ValidateRequest(const Request& request);
+/// True CFG (`negative + scale * (positive - negative)`, Diffusers
+/// `true_cfg_scale`) runs above 1. An omitted scale is 1 (unguided), as the
+/// Qwen-Image-2.1 pipeline's default: a negative prompt alone has no effect.
+float ResolveGuidance(const Request& request);
+/// Model prompt for the caller's prompt and background intent. Transparent
+/// requests receive the RGBA framing Qwen-Image-2.1 needs for alpha output;
+/// auto and opaque requests keep the prompt unchanged.
+std::string ConditionPrompt(std::string_view prompt,
+                            ext::ImageBackground background);
+/// Qwen-Image-2.1 accepts reference images, transparent backgrounds, true
+/// classifier-free guidance and image to image.
+inline constexpr ext::ImageCapabilities kCapabilities{
+    .edits = true,
+    .transparent_background = true,
+    .guidance = true,
+    .image_to_image = true};
 std::vector<float> FlowSigmas(int steps, int image_tokens);
+/// Image to image as Diffusers' img2img `strength`: the tail of a full
+/// schedule that runs its last `steps * strength` steps (at least one).
+/// Strength 1 returns the schedule unchanged.
+std::vector<float> StrengthTail(std::vector<float> sigmas, double strength);
+
+/// Base flow matching or the qualified checkpoint-supplied Turbo schedule.
+struct SamplingConfig {
+  std::vector<float> sample_sigmas;
+  bool IsTurbo() const { return !sample_sigmas.empty(); }
+  int DefaultSteps() const { return IsTurbo() ? 8 : 40; }
+  int ResolveSteps(int requested) const;
+  std::vector<float> Sigmas(int requested, int image_tokens) const;
+  /// Sigmas() truncated by StrengthTail(), for both the flow and the fixed
+  /// Turbo schedule.
+  std::vector<float> DenoiseSigmas(int requested, double strength,
+                                   int image_tokens) const;
+};
 
 class Model {
 public:
@@ -74,6 +97,16 @@ public:
                   const CancellationCheck& cancelled = {},
                   const Observer& observer = {});
   std::vector<std::uint32_t> Tokenize(std::string_view text) const;
+  const SamplingConfig& sampling() const;
+  /// Validate and register an adapter before serving; requests select it by
+  /// name.
+  LoraInfo AddLora(const std::string& name, const std::filesystem::path& path);
+  /// Adapters merged into the transformer weights now (does not wait for
+  /// Generate); empty while a switch is in progress or after one failed.
+  std::vector<Lora> ActiveLoras() const;
+  /// True after a failed request left the HIP context unusable (a sticky
+  /// launch failure or a failed library call); only a new process recovers.
+  bool DeviceLost() const;
 
 private:
   struct Impl;

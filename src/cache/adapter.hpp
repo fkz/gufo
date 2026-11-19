@@ -3,10 +3,12 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
 
+#include "src/cache/cost.hpp"
 #include "src/cache/identity.hpp"
 #include "src/cache/stream.hpp"
 #include "src/cache/types.hpp"
@@ -51,6 +53,13 @@ public:
   [[nodiscard]] virtual bool ExecutionComplete() const noexcept { return true; }
 };
 
+// One pinned-host backing class: block size, block count and per-block host
+// metadata. Models own the arithmetic that fills it; the backing provider
+// commits what the plan asks for.
+struct BackingClass {
+  std::size_t block_bytes{}, blocks{}, metadata_bytes{};
+};
+
 class Adapter {
 public:
   Adapter() = default;
@@ -59,8 +68,26 @@ public:
   Adapter& operator=(const Adapter&) = delete;
   Adapter(Adapter&&) = delete;
   Adapter& operator=(Adapter&&) = delete;
+  // Host backing classes this adapter needs for `ram_bytes`. Adapters with
+  // pinned backing override it; the default reports none, so a resource
+  // provider rejects the adapter instead of downcasting it to a model type.
+  [[nodiscard]] virtual std::vector<BackingClass> BackingPlan(
+      std::size_t) const {
+    return {};
+  }
+  // Optional fixed model/mode estimate. Unknown adapters retain the existing
+  // token-based behavior; estimates are diagnostic until independently
+  // qualified.
+  [[nodiscard]] virtual std::optional<CostEstimate> Cost() const { return {}; }
   [[nodiscard]] virtual Capabilities GetCapabilities() const = 0;
   // Descriptors are stable for the adapter lifetime; each ID is unique.
+  //
+  // A kWindowRows component may keep its rows in a ring. Row numbers stay
+  // absolute: positions and transfers count every row since the start, never a
+  // ring offset. The ring holds at least window_rows + rows_per_chunk - 1 rows,
+  // the most a checkpoint retains. Call MutationGuard::BeforeOverwrite before
+  // evicting a row, as for any overwrite, because checkpoints may borrow it.
+  // BorrowRowsView returns empty for a range that wraps the ring.
   [[nodiscard]] virtual std::span<const ComponentDescriptor> Components()
       const = 0;
   [[nodiscard]] virtual Identity CompatibilityIdentity() const = 0;

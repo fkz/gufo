@@ -19,10 +19,10 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
-#include "src/models/qwen/hip/execution_policy.hpp"
+#include "src/families/qwen/hip_common/attention_policy.hpp"
+#include "src/families/qwen/hip_common/execution_policy.hpp"
+#include "src/families/qwen/kernels/ops.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/modules/ffn.hpp"
 #include "src/models/qwen/modules/layer_view.hpp"
 #include "src/models/qwen/modules/module_ctx.hpp"
@@ -64,6 +64,9 @@ void TestHipGraphDecodeStep() {
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_weight, h_w.data(), hidden_size * sizeof(float),
                       hipMemcpyHostToDevice));
+  // The graph under test executes on a nonblocking stream, which does not
+  // order with these default-stream uploads; drain before capture.
+  HIP_CHECK(hipDeviceSynchronize());
 
   gufo::hip::detail::HipGraphDecodeExecutor executor;
   constexpr gufo::hip::detail::HipGraphCaptureKey graph_key{

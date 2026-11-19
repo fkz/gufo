@@ -3,10 +3,11 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    # ROCm 10.1.0 as rocmPackages_10, on nixos-unstable (gufo-org/nixpkgs
-    # rocm-10.1). Binaries for gfx1151 are on gufo.cachix.org.
-    # Only the rocm10 package and shell use it; the default stays on the
-    # nixpkgs ROCm release.
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    # ROCm 10.1.0 / HIP Clang 24, with gfx1151 binaries on gufo.cachix.org.
     nixpkgs-rocm10.url = "github:gufo-org/nixpkgs/1a6ba8bc6f744f7a843d025e46bc9911b4b6c37d";
     # Reference ASR/TTS runtime for benchmark comparisons; exposes a
     # ROCm gfx1151 package tuned for Strix Halo.
@@ -26,7 +27,7 @@
   };
 
   outputs =
-    { self, nixpkgs, nixpkgs-rocm10, audio-cpp }:
+    { self, nixpkgs, nixpkgs-rocm10, audio-cpp, rust-overlay }:
     let
       # Strix Halo is a Linux x86-64-only target (see README non-goals).
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" ];
@@ -40,28 +41,33 @@
         value;
       revision = self.shortRev or self.dirtyShortRev or "dirty";
 
-      pkgs = forAllSystems (system: import nixpkgs { inherit system; });
+      # Reuse the cached ROCm closure, including its matching compiler/runtime.
+      # Python and general dependencies stay on the nixos-unstable input.
+      rocmPkgs = forAllSystems (system: import nixpkgs-rocm10 { inherit system; });
+      pkgs = forAllSystems (system: import nixpkgs {
+        inherit system;
+        overlays = [ rust-overlay.overlays.default (_final: _prev: {
+          rocmPackages = rocmPkgs.${system}.rocmPackages_10;
+        }) ];
+      });
+
+      rustToolchains = forAllSystems (system:
+        pkgs.${system}.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml
+      );
 
       gufoPackages = forAllSystems (
         system:
-        pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit revision; }
-      );
-
-      # Evaluation build against ROCm 10.1.0. The whole package set comes from
-      # nixpkgs-rocm10 so glibc, stdenv and the ROCm compiler stay consistent.
-      gufoRocm10 = forAllSystems (
-        system:
-        let
-          pkgsRocm10 = import nixpkgs-rocm10 { inherit system; };
-        in
-        (pkgsRocm10.callPackage ./.devops/nix/scope.nix { inherit revision; }).gufo.override {
-          # Kernel libraries built for gfx1151 only, cached on gufo.cachix.org.
-          rocmPackages = pkgsRocm10.rocmPackages_10.gfx1151;
+        pkgs.${system}.callPackage ./.devops/nix/scope.nix {
+          inherit revision;
+          rustToolchain = rustToolchains.${system};
+          rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
         }
       );
 
       llamaReferences = forAllSystems (
-        system: pkgs.${system}.callPackage ./.devops/nix/llama-cpp-reference.nix { }
+        system: pkgs.${system}.callPackage ./.devops/nix/llama-cpp-reference.nix {
+          rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
+        }
       );
 
       alexnetWeights = system:
@@ -81,27 +87,32 @@
       # dependency of the server (see tools/README.md for the offline toolchain).
       # Unified python313 + torchWithRocm: every Strix Halo box ships ROCm, so
       # the single toolchain serves CPU flows and the --device cuda
-      # reference forward alike. gfx1151 verified on this host.
+      # reference forward alike. Built from plain nixos-unstable, without the
+      # ROCm 10.1 overlay, so torchWithRocm and its ROCm closure come from
+      # cache.nixos.org.
       pythonTools = system:
-        let pt = pkgs.${system}.python313; in
+        let pt = nixpkgs.legacyPackages.${system}.python313; in
         pt.withPackages (
           ps:
           let
             # Nixpkgs' default torchvision/lpips closures use CPU torch.
             # Override both edges so evaluation has one ROCm torch derivation.
+            # The default target list includes gfx1151; keep it so the cached
+            # build is used.
+            torchRocm = ps.torchWithRocm;
             torchvisionRocm = ps.torchvision.override {
-              torch = ps.torchWithRocm;
+              torch = torchRocm;
             };
             lpipsRocm = ps.lpips.override {
-              torch = ps.torchWithRocm;
+              torch = torchRocm;
               torchvision = torchvisionRocm;
             };
             accelerateRocm = ps.accelerate.override {
-              torch = ps.torchWithRocm;
+              torch = torchRocm;
             };
           in
           [
-            ps.torchWithRocm
+            torchRocm
             torchvisionRocm
             ps.transformers
             accelerateRocm
@@ -112,147 +123,17 @@
             ps.jsonschema # independent structured-output schema oracle
             lpipsRocm
             ps.numpy
+            ps.av # official video decoder oracle
             ps.librosa # pinned official EmbeddingGemma audio decoder oracle
             ps.scipy
             ps.matplotlib # benchmark charts (tools/bench/model-bench.py render)
           ]
         );
-    in
-    {
-      lib = {
-        inherit releaseVersion revision;
-        mkGufoServe =
-          {
-            pkgs ? null,
-            system ? pkgs.system or "x86_64-linux",
-            gufo ? self.packages.${system}.default,
-            ...
-          }@args:
-          let
-            targetScope = gufoPackages.${system};
-            mkServeFn = targetScope.mkServe.override {
-              inherit gufo;
-            };
-            fnArgs = builtins.removeAttrs args [ "pkgs" "system" "gufo" ];
-          in
-          mkServeFn fnArgs;
-        mkServe = self.lib.mkGufoServe;
-      } // forAllSystems (system: {
-        mkGufoServe =
-          args:
-          self.lib.mkGufoServe (args // { inherit system; });
-        mkServe =
-          args:
-          self.lib.mkGufoServe (args // { inherit system; });
-      });
-
-      packages = forAllSystems (
-        system:
-        let
-          base = gufoPackages.${system}.gufo;
-        in
-        {
-          default = base;
-          gfx1152 = base.override { gpuTarget = "gfx1152"; };
-          # Official artifacts select this output from a tagged source. The
-          # default package remains visibly developmental on moving branches.
-          release = base.override { inherit releaseVersion; };
-          # ROCm 10.1.0 evaluation build; not a release or check input.
-          rocm10 = gufoRocm10.${system};
-          # Windows test binaries of the platform leaves and the CPU cache,
-          # cross-built here and run on a Windows CI host.
-          windows-platform-tests =
-            pkgs.${system}.pkgsCross.mingwW64.callPackage ./.devops/nix/windows-platform-tests.nix
-              {
-                # The build-host ccache from the main package set, which the
-                # binary cache already holds.
-                inherit (pkgs.${system}) ccache;
-              };
-          # Optional benchmark packages: excluded from Gufo, the default
-          # development shell and hosted checks.
-          ds4-reference = pkgs.${system}.callPackage ./.devops/nix/ds4-reference.nix { };
-          llama-cpp-reference = llamaReferences.${system}.release;
-          llama-cpp-mtp-reference = llamaReferences.${system}.mtp;
-        }
-      );
-
-      devShells = forAllSystems (
-        system:
-        {
-          # Unified toolchain (CPU + ROCm torch): one default shell serves all
-          # offline CPU flows and the ROCm reference forward.
-          default = pkgs.${system}.mkShell {
-            inputsFrom = [ self.packages.${system}.default ];
-            packages = [
-              (pythonTools system)
-              pkgs.${system}.clang-tools
-              pkgs.${system}.ffmpeg-headless
-              pkgs.${system}.sox
-              pkgs.${system}.rocmPackages.rocprofiler-sdk
-              pkgs.${system}.sqlite
-              # Debugging and repository work. The test presets build
-              # RelWithDebInfo with assertions, and contributors commit with
-              pkgs.${system}.gdb
-              pkgs.${system}.git
-              pkgs.${system}.ripgrep
-              pkgs.${system}.radeontop
-              # Compiler cache for the local loop; CMake attaches it as the C
-              # and C++ launcher when it is on PATH, as the CPU checks do.
-              pkgs.${system}.ccache
-              audio-cpp.packages.${system}.rocm-gfx1151
-            ];
-            env = {
-              TORCH_HOME = "${alexnetTorchHome system}";
-              # CMake links HIP binaries against the patched ROCr.
-              GUFO_ROCR_LIBRARY_DIR = "${self.packages.${system}.default.rocmRuntime}/lib";
-              LD_LIBRARY_PATH = pkgs.${system}.lib.makeLibraryPath [
-                self.packages.${system}.default.rocmRuntime
-                pkgs.${system}.stdenv.cc.cc.lib
-                pkgs.${system}.zlib
-              ];
-            };
-            # Cache policy mirrors the CPU check derivations. CCACHE_DIR stays
-            # at the user default so a container run can mount it as a volume.
-            shellHook = ''
-              export CCACHE_BASEDIR="$PWD"
-              export CCACHE_COMPILERCHECK=content
-              export CCACHE_MAXSIZE=2G
-              export CCACHE_NOHASHDIR=true
-            '';
-          };
-
-          # ROCm 10.1.0 evaluation shell: builds and profiles the rocm10
-          # package. It omits the ROCm torch tools, which would rebuild torch.
-          rocm10 =
-            let
-              pkgsRocm10 = import nixpkgs-rocm10 { inherit system; };
-              gufo = self.packages.${system}.rocm10;
-            in
-            pkgsRocm10.mkShell {
-              inputsFrom = [ gufo ];
-              packages = [
-                gufo.rocmPackages.rocprofiler-sdk
-                pkgsRocm10.python3
-                pkgsRocm10.gdb
-                pkgsRocm10.git
-                pkgsRocm10.ripgrep
-                pkgsRocm10.ccache
-              ];
-              env.LD_LIBRARY_PATH = pkgsRocm10.lib.makeLibraryPath [
-                gufo.rocmRuntime
-                pkgsRocm10.stdenv.cc.cc.lib
-                pkgsRocm10.zlib
-              ];
-              env.GUFO_ROCR_LIBRARY_DIR = "${gufo.rocmRuntime}/lib";
-              shellHook = self.devShells.${system}.default.shellHook;
-            };
-        }
-      );
-
-      checks = forAllSystems (
+      allChecks = forAllSystems (
         system:
         let
           pkgsSys = pkgs.${system};
+          rustToolchain = rustToolchains.${system};
           root = toString ./.;
           mkFilteredSource =
             {
@@ -282,6 +163,7 @@
 
           formatSource = mkFilteredSource {
             directories = [
+              "include"
               "src"
               "tests"
             ];
@@ -293,6 +175,7 @@
 
           staticAnalysisSource = mkFilteredSource {
             directories = [
+              "include"
               "cmake"
               "src"
             ];
@@ -300,11 +183,18 @@
               ".clang-format"
               ".clang-tidy"
               "CMakeLists.txt"
+              "rust-toolchain.toml"
+              "Cargo.toml"
+              "Cargo.lock"
+              "extensions.lock"
             ];
           };
 
           testSource = mkFilteredSource {
             directories = [
+              "examples/extension_template"
+              "include"
+              "schemas"
               "cmake"
               "src"
               "tests"
@@ -313,7 +203,13 @@
             files = [
               ".clang-format"
               "CMakeLists.txt"
-              "docs/RELEASING.md"
+              "rust-toolchain.toml"
+              "Cargo.toml"
+              "Cargo.lock"
+              "extensions.lock"
+              "AGENTS.md"
+              "docs/internal/releasing.md"
+              "docs/models/README.md"
               "tools/prof/prof.py"
               "tools/bench/speculative-corpus.py"
             ];
@@ -359,6 +255,64 @@
             ];
           };
 
+          cargoSetup = import ./.devops/nix/rust-cargo.nix {
+            inherit (pkgsSys) lib rustPlatform;
+          };
+
+          # sccache's local storage supports one server. Build in a private
+          # snapshot, then publish immutable entries atomically with rsync.
+          # Shared files must be accessible to different Nix build users.
+          rustCacheSetup = ''
+            if [[ -d /tmp/gufo-rust-cache && -w /tmp/gufo-rust-cache ]]; then
+              rust_shared_cache=/tmp/gufo-rust-cache/objects-v1
+              (umask 000; mkdir -p "$rust_shared_cache")
+              export SCCACHE_DIR="$TMPDIR/rust-cache"
+              mkdir -p "$SCCACHE_DIR"
+              rsync -r --exclude='.*' "$rust_shared_cache/" "$SCCACHE_DIR/"
+              export SCCACHE_SERVER_UDS="$TMPDIR/sccache.sock"
+              export CARGO_INCREMENTAL=0
+              export RUSTC_WRAPPER=${pkgsSys.sccache}/bin/sccache
+              save_rust_cache() {
+                sccache --stop-server || true
+                # rsync renames complete temporary files into place. Never
+                # replace another builder's entry for the same compiler key.
+                (umask 000; rsync -r --ignore-existing --chmod=ugo=rwX \
+                  "$SCCACHE_DIR/" "$rust_shared_cache/") || true
+              }
+              trap save_rust_cache EXIT
+            fi
+          '';
+
+          rustCheck = pkgsSys.runCommand "check-rust" {
+            nativeBuildInputs = [ rustToolchain pkgsSys.stdenv.cc pkgsSys.pkg-config pkgsSys.python3 pkgsSys.sccache pkgsSys.rsync ];
+            buildInputs = [ pkgsSys.libopus ];
+            src = mkFilteredSource {
+              # One source list: a new workspace member cannot silently miss CI.
+              directories = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.members;
+              files = [
+                "rust-toolchain.toml"
+                "Cargo.toml"
+                "Cargo.lock"
+                "tools/ci/check-rust-workspace.py"
+                "tests/tools/check_rust_workspace_test.py"
+              ] ++ map (name: "src/core/${name}/Cargo.toml") (builtins.filter
+                (name: builtins.pathExists (./src/core + "/${name}/Cargo.toml"))
+                (builtins.attrNames (builtins.readDir ./src/core)));
+            };
+          } (cargoSetup + rustCacheSetup + ''
+            export HOME=$TMPDIR
+            cp -r "$src" source
+            chmod -R u+w source
+            cd source
+            python3 tools/ci/check-rust-workspace.py
+            python3 tests/tools/check_rust_workspace_test.py
+            cargo fmt --all --check
+            cargo clippy --workspace --locked --offline --all-targets -- -D warnings
+            cargo test --workspace --locked --offline
+            mkdir -p $out
+            echo "PASS: Rust formatting, clippy and unit tests clean" > $out/result.txt
+          '');
+
           formatCheck = pkgsSys.runCommand "check-format" {
             nativeBuildInputs = [ pkgsSys.clang-tools pkgsSys.python3 ];
             src = formatSource;
@@ -383,12 +337,13 @@
               pkgsSys.libpng
               pkgsSys.libjpeg
               pkgsSys.libwebp
-              pkgsSys.libsndfile
-              pkgsSys.soxr
+              pkgsSys.libopus
+              rustToolchain
+              pkgsSys.ffmpeg-headless
               pkgsSys.openssl
             ];
             src = staticAnalysisSource;
-          } ''
+          } (cargoSetup + ''
             export HOME=$TMPDIR
             mkdir -p build && cd build
             cmake "$src" -GNinja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBUILD_TESTING=OFF -DENGINE_ENABLE_HIP=OFF
@@ -426,7 +381,7 @@
 
             mkdir -p $out
             echo "PASS: clang-tidy static analysis clean" > $out/result.txt
-          '';
+          '');
 
           dependencyInventoryCheck = pkgsSys.runCommand "check-dependency-inventory" {
             nativeBuildInputs = [ pkgsSys.python3 ];
@@ -489,64 +444,85 @@
             echo "PASS: MiniMax H3 pinned teacher and offline LPIPS clean" > $out/result.txt
           '';
 
-          mkTestCheck = full: pkgsSys.runCommand (if full then "check-tests" else "check-pr-tests") {
+          testCheck = pkgsSys.runCommand "check-tests" {
             nativeBuildInputs = [
               pkgsSys.stdenv.cc
               pkgsSys.ccache
+              pkgsSys.sccache
+              pkgsSys.rsync
               pkgsSys.cmake
               pkgsSys.ninja
               pkgsSys.pkg-config
-              (if full then pkgsSys.python3.withPackages (ps: [ ps.numpy ]) else pkgsSys.python3)
+              # Registry installs in the extension module CLI test.
+              pkgsSys.git
+              (pkgsSys.python3.withPackages (ps: [ ps.jsonschema ps.numpy ]))
               pkgsSys.icu
               pkgsSys.curl
               pkgsSys.libpng
               pkgsSys.libjpeg
               pkgsSys.libwebp
-              pkgsSys.libsndfile
-              pkgsSys.soxr
+              pkgsSys.libopus
+              rustToolchain
+              pkgsSys.ffmpeg-headless
               pkgsSys.openssl
+              # The NPU runtime links XRT on Linux.
+              gufoPackages.${system}.xrt-amdxdna
+              pkgsSys.libuuid
             ];
             src = testSource;
-          } ''
+          } (cargoSetup + rustCacheSetup + ''
             export HOME=$TMPDIR
+            export XILINX_XRT=${gufoPackages.${system}.xrt-amdxdna}/opt/xilinx/xrt
             set -euo pipefail
+
+            # The store source name changes on every revision. base_dir alone
+            # rewrites it to ../<hash>-source, which still changes cache keys.
+            # Compile a writable copy at a stable sandbox path instead.
+            cp -r "$src" source
+            chmod -R u+w source
+            src="$PWD/source"
 
             ccache_launcher=
             ccache_dir=/tmp/gufo-ccache
             if [[ -d "$ccache_dir" && -w "$ccache_dir" ]]; then
               export CCACHE_DIR="$ccache_dir"
-              export CCACHE_BASEDIR="$src"
+              export CCACHE_BASEDIR="$PWD"
               export CCACHE_COMPILERCHECK=content
               export CCACHE_MAXSIZE=2G
               export CCACHE_NOHASHDIR=true
               export CCACHE_UMASK=000
-              export NIX_CFLAGS_COMPILE="''${NIX_CFLAGS_COMPILE:-} -fdebug-prefix-map=$src=."
+              export NIX_CFLAGS_COMPILE="''${NIX_CFLAGS_COMPILE:-} -fdebug-prefix-map=$PWD=."
               ccache_launcher=-DCMAKE_CXX_COMPILER_LAUNCHER=ccache
               ccache --zero-stats
             fi
 
             mkdir -p build && cd build
             cmake "$src" -GNinja $ccache_launcher -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON -DENGINE_ENABLE_HIP=OFF
-            ${if full then ''
-              cmake --build . --parallel "$NIX_BUILD_CORES"
-              ctest --output-on-failure --timeout 120
-            '' else ''
-              cmake --build . --parallel "$NIX_BUILD_CORES" --target check-pr
-            ''}
+            cmake --build . --parallel "$NIX_BUILD_CORES"
+            test_jobs="$NIX_BUILD_CORES"
+            if [[ "$test_jobs" -eq 0 || "$test_jobs" -gt 4 ]]; then test_jobs=4; fi
+            ctest --output-on-failure --parallel "$test_jobs" --timeout 120 \
+              --label-exclude h3-qualification --exclude-regex '^serving_bench_test$'
+
+            # Build the real CPU lock-mode executable, using the same source
+            # and toolchain. This does not replace shipped HIP qualification.
+            cmake "$src" -B ../lock-build -GNinja $ccache_launcher -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=OFF -DENGINE_ENABLE_HIP=OFF -DGUFO_EXTENSIONS_FROM_LOCK=ON
+            cmake --build ../lock-build --target gufo --parallel "$NIX_BUILD_CORES"
+            ../lock-build/gufo diagnose --section extensions --json
+            ../lock-build/gufo --version | grep -Fx 'Extension selection: lock'
 
             if [[ -n "$ccache_launcher" ]]; then
               ccache --show-stats
             fi
 
             mkdir -p $out
-            echo "PASS: ${if full then "Full CPU" else "Hosted CPU contract"} suite passed" > $out/result.txt
-          '';
+            echo "PASS: CPU suite passed" > $out/result.txt
+          '');
 
-          testCheck = mkTestCheck true;
-          prTestCheck = mkTestCheck false;
 
           mkServeCheck =
             let
+              evaluationTests = import ./.devops/nix/mk-serve-tests.nix { lib = pkgsSys.lib; };
               # Test command rendering without realizing the GPU package.
               mkServe = args: self.lib.${system}.mkGufoServe (args // { gufo = "/gufo-test"; });
               ttsCmd = mkServe {
@@ -684,23 +660,24 @@
               echo "$image_str" | grep -F -- "--max-request-bytes 33554432"
               echo "$image_str" | grep -F -- "image --model /var/models/qwen-image --served-model-name qwen-image-test"
               mkdir -p $out
-              echo "PASS: mkGufoServe CLI string check passed" > $out/result.txt
+              echo "PASS: mkGufoServe CLI string check passed; ${toString (builtins.length evaluationTests.passed)} metadata evaluation cases" > $out/result.txt
             '';
 
-          # The hosted runner builds CPU contracts only. GPU compilation,
-          # whole-tree clang-tidy, full CPU and H3 oracles are explicit checks.
-          prCheck = pkgsSys.runCommand "check-pr" { } ''
-            mkdir -p $out
-            cat ${formatCheck}/result.txt \
-                ${dependencyInventoryCheck}/result.txt \
-                ${docsCheck}/result.txt \
-                ${prTestCheck}/result.txt \
-                ${mkServeCheck}/result.txt > $out/pr-summary.txt
-            cat $out/pr-summary.txt
-          '';
+          mkServeNixosCheck =
+            assert import ./.devops/nix/mk-serve-nixos-tests.nix {
+              pkgs = pkgsSys;
+              defaultPackage = self.packages.${system}.default;
+              releasePackage = self.packages.${system}.release;
+            };
+            pkgsSys.runCommand "check-mk-serve-nixos" { } ''
+              mkdir -p $out
+              echo "PASS: default/release mkServe NixOS service evaluation" > $out/result.txt
+            '';
+
         in
         {
           format = formatCheck;
+          rust = rustCheck;
           static-analysis = staticAnalysisCheck;
           dependency-inventory = dependencyInventoryCheck;
           docs = docsCheck;
@@ -708,10 +685,162 @@
           h3-quality = h3QualityCheck;
           h3-ml-quality = h3MlQualityCheck;
           tests = testCheck;
-          pr-tests = prTestCheck;
           mk-serve = mkServeCheck;
-          pr = prCheck;
+          mk-serve-nixos = mkServeNixosCheck;
         }
       );
+    in
+    {
+      lib = {
+        inherit releaseVersion revision;
+        mkGufoServe =
+          {
+            pkgs ? null,
+            system ? pkgs.system or "x86_64-linux",
+            gufo ? self.packages.${system}.default,
+            ...
+          }@args:
+          let
+            targetScope = gufoPackages.${system};
+            mkServeFn = targetScope.mkServe.override {
+              inherit gufo;
+            };
+            fnArgs = builtins.removeAttrs args [ "pkgs" "system" "gufo" ];
+          in
+          mkServeFn fnArgs;
+        mkServe = self.lib.mkGufoServe;
+      } // forAllSystems (system: {
+        # gufo loading `extensions` (pinned sources) as modules built against
+        # its SDK; `gufo` defaults to the development package.
+        withExtensionModules =
+          args:
+          gufoPackages.${system}.extensionModules.withExtensions
+            ({ gufo = self.packages.${system}.default; } // args);
+        mkGufoServe =
+          args:
+          self.lib.mkGufoServe (args // { inherit system; });
+        mkServe =
+          args:
+          self.lib.mkGufoServe (args // { inherit system; });
+      });
+
+      checks = forAllSystems (system:
+        builtins.removeAttrs allChecks.${system} [
+          "h3-manifest" "h3-quality" "h3-ml-quality" "static-analysis"
+        ]);
+
+      packages = forAllSystems (
+        system:
+        let
+          base = gufoPackages.${system}.gufo;
+        in
+        {
+          default = base;
+          gfx1152 = base.override {
+            gpuTarget = "gfx1152";
+            rocmPackages = pkgs.${system}.rocmPackages.gfx1152;
+          };
+          # Explicit qualification suites stay out of `nix flake check`.
+          inherit (allChecks.${system}) h3-manifest h3-quality h3-ml-quality static-analysis;
+          # Official artifacts select this output from a tagged source. The
+          # default package remains visibly developmental on moving branches.
+          release = base.override { inherit releaseVersion; extensionsFromLock = true; };
+          # The gpu-test configuration with its assertions, which Devlab's
+          # functional correctness runs against (docs: tests/functional/README.md).
+          checked = base.override { checked = true; };
+          # gufo with its extension SDK, for `gufo extension install`.
+          sdk = gufoPackages.${system}.extensionModules.withSdk base;
+          release-sdk = gufoPackages.${system}.extensionModules.withSdk
+            self.packages.${system}.release;
+          # Windows test binaries of the platform leaves and the CPU cache,
+          # cross-built here and run on a Windows CI host.
+          windows-platform-tests =
+            pkgs.${system}.pkgsCross.mingwW64.callPackage ./.devops/nix/windows-platform-tests.nix
+              {
+                # The build-host ccache from the main package set, which the
+                # binary cache already holds.
+                inherit (pkgs.${system}) ccache;
+              };
+          # Optional benchmark packages: excluded from Gufo, the default
+          # development shell and hosted checks.
+          ds4-reference = pkgs.${system}.callPackage ./.devops/nix/ds4-reference.nix {
+            rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
+          };
+          llama-cpp-reference = llamaReferences.${system}.release;
+          llama-cpp-mtp-reference = llamaReferences.${system}.mtp;
+          # Experimental HRX HIP runtime and Gufo wrapped to run on it; not
+          # part of releases or hosted checks (docs/internal/hrx-migration.md).
+          hrx = pkgs.${system}.callPackage ./.devops/nix/hrx {
+            rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
+          };
+          # HRX with Loom's compiler and serving tools for GPU and NPU.
+          hrx-loom = self.packages.${system}.hrx.override { withLoom = true; };
+          gufo-hrx = pkgs.${system}.callPackage ./.devops/nix/hrx/gufo.nix {
+            gufo = base;
+            hrx = self.packages.${system}.hrx;
+          };
+          # XRT with its amdxdna plugin, as the Gufo package links it.
+          xrt-amdxdna = gufoPackages.${system}.xrt-amdxdna;
+          iron = gufoPackages.${system}.iron;
+        }
+      );
+
+      devShells = forAllSystems (
+        system:
+        {
+          # Unified toolchain (CPU + ROCm torch): one default shell serves all
+          # offline CPU flows and the ROCm reference forward.
+          default = pkgs.${system}.mkShell {
+            inputsFrom = [ self.packages.${system}.default ];
+            packages = [
+              (pythonTools system)
+              pkgs.${system}.clang-tools
+              pkgs.${system}.ffmpeg-headless
+              pkgs.${system}.sox
+              pkgs.${system}.rocmPackages.gfx1151.rocprofiler-sdk
+              pkgs.${system}.sqlite
+              # Debugging and repository work. The test presets build
+              # RelWithDebInfo with assertions, and contributors commit with
+              pkgs.${system}.gdb
+              pkgs.${system}.git
+              pkgs.${system}.ripgrep
+              pkgs.${system}.radeontop
+              # Compiler cache for the local loop; CMake attaches it as the C
+              # and C++ launcher when it is on PATH, as the CPU checks do.
+              pkgs.${system}.ccache
+              # NPU designs: IRON (mlir-aie) and Peano; CMake compiles the
+              # in-tree designs with it (cmake/GufoNpuDesigns.cmake).
+              gufoPackages.${system}.iron
+              (audio-cpp.packages.${system}.rocm-gfx1151.override {
+                rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
+              })
+            ];
+            env = {
+              TORCH_HOME = "${alexnetTorchHome system}";
+              # CMake finds XRT here, and XRT its amdxdna plugin.
+              XILINX_XRT = "${gufoPackages.${system}.xrt-amdxdna}/opt/xilinx/xrt";
+              PEANO_INSTALL_DIR = gufoPackages.${system}.iron.peano;
+              GUFO_IRON_PYTHON = "${gufoPackages.${system}.iron}/bin/python3";
+              # CMake links HIP binaries against the patched ROCr.
+              GUFO_ROCR_LIBRARY_DIR = "${self.packages.${system}.default.rocmRuntime}/lib";
+              LD_LIBRARY_PATH = pkgs.${system}.lib.makeLibraryPath [
+                self.packages.${system}.default.rocmRuntime
+                pkgs.${system}.stdenv.cc.cc.lib
+                pkgs.${system}.zlib
+              ];
+            };
+            # Cache policy mirrors the CPU check derivations. CCACHE_DIR stays
+            # at the user default so a container run can mount it as a volume.
+            shellHook = ''
+              export CCACHE_BASEDIR="$PWD"
+              export CCACHE_COMPILERCHECK=content
+              export CCACHE_MAXSIZE=2G
+              export CCACHE_NOHASHDIR=true
+            '';
+          };
+        }
+      );
+
+
     };
 }

@@ -8,9 +8,11 @@
 #include <map>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "src/models/qwen_image_21/hip/blas.hpp"
+#include "src/models/qwen_image_21/lora.hpp"
 #include "src/models/qwen_image_21/model.hpp"
 #include "src/models/qwen_image_21/weights.hpp"
 
@@ -43,11 +45,32 @@ bool ExpandConvolution3(const std::uint16_t* input, std::uint16_t* output,
 void ReorderHeads(const std::uint16_t* input, std::uint16_t* output, int rows,
                   int heads, int kv_heads, int dim, bool inverse,
                   hipStream_t stream);
+/// Up to three head-major key/value buffers read as one key sequence:
+/// segment i holds rows [end[i-1], end[i]) at a per-head stride of stride[i]
+/// rows. Unused trailing segments repeat the previous end.
+struct KeySegments {
+  const std::uint16_t* keys[3]{};
+  const std::uint16_t* values[3]{};
+  int end[3]{};
+  int stride[3]{};
+};
+void FusedAttention128Segmented(const std::uint16_t* queries,
+                                const KeySegments& segments,
+                                std::uint16_t* output, int heads, int rows,
+                                int query_start, int query_count,
+                                hipStream_t stream, const int* limits);
 void FusedAttention128(const std::uint16_t* queries, const std::uint16_t* keys,
                        const std::uint16_t* values, std::uint16_t* output,
                        int heads, int rows, int count, int query_start,
                        hipStream_t stream, int query_count = 128,
                        const int* limits = nullptr);
+// weight[rows x cols] += scale * up[rows x rank] * down[rank x cols]; FP32,
+// row-major.
+void LoraLowRank(hipblasHandle_t blas, float* weight, const float* up,
+                 const float* down, int rows, int cols, int rank, float scale);
+// ComfyUI DoRA on the output axis; norms are of `weight` before this update.
+void LoraDora(float* weight, const float* delta, const float* magnitude,
+              int rows, int cols, float strength, hipStream_t stream);
 
 struct Matrix {
   std::shared_ptr<void> owner;
@@ -81,6 +104,16 @@ public:
   /// FP32 rotary tables; logical storage uses two BF16-sized slots per float.
   Matrix UploadFloat(std::span<const float> values, int rows, int cols);
   Matrix Weight(std::string_view name);
+  /// Replace the adapter terms by target name. Weights whose terms change
+  /// are dropped and rebuild from the checkpoint originals on next use. Returns
+  /// the names to rebuild for the switch: every target whose terms change or
+  /// that is not resident, and the dropped weights that lost their terms.
+  std::vector<std::string> SetLoras(
+      std::map<std::string, std::vector<LoraTerm>, std::less<>> terms);
+  /// Upload every weight under `prefix` that is not resident through the
+  /// bounded file-streaming path, merging adapter terms as on first load.
+  /// False when the files cannot be streamed; Weight() then reads the mapping.
+  bool UploadMissing(std::string_view prefix) { return UploadGroup(prefix); }
   Matrix Linear(const Matrix& x, const std::string& name);
   Matrix Normalize(const Matrix& x, Norm kind, const std::string& weight = {},
                    float epsilon = 1e-6F, bool silu = false);
@@ -102,6 +135,21 @@ public:
                    int kv_heads, int dim,
                    const std::vector<int>& key_limits = {});
   Matrix Concat(std::span<const Matrix> matrices);
+  /// 32-head, 128-dim head-major copy of a row-major K or V matrix.
+  Matrix HeadLayout(const Matrix& x);
+  /// Rows [0, rows) of head-major key/value buffers (per-head stride:
+  /// keys.rows).
+  struct HeadKeys {
+    Matrix keys, values;
+    int rows{0};
+  };
+  /// Attention of row-major queries over the concatenated segments without
+  /// copying them; limits as in Attention.
+  Matrix SegmentedAttention(const Matrix& q, std::span<const HeadKeys> segments,
+                            const std::vector<int>& key_limits = {});
+  std::size_t CachedBytes() const;
+  /// Bytes of a weight group that are not resident yet.
+  std::size_t MissingBytes(std::string_view prefix) const;
   Matrix Columns(const Matrix& x, int start, int count);
   Matrix Embed(const Matrix& weights, std::span<const std::uint32_t> ids);
   Matrix ReplaceRows(const Matrix& x, const Matrix& values,
@@ -113,6 +161,8 @@ public:
   Matrix UpShortcut(const Matrix& x, int height, int width, int out_channels,
                     int temporal);
   Matrix Euler(const Matrix& x, const Matrix& velocity, float dt);
+  Matrix Guidance(const Matrix& positive, const Matrix& negative, float scale);
+  Matrix NoiseMix(const Matrix& noise, const Matrix& image, float sigma);
   Matrix LatentScale(const Matrix& x, std::span<const float> mean,
                      std::span<const float> stddev, bool encode);
   Matrix VisionPosition(const Matrix& x, int height, int width);
@@ -120,6 +170,16 @@ public:
   void Observe(const Observer& observer, std::string_view name,
                const Matrix& matrix);
   void Synchronize();
+  /// Drop a resident weight component (e.g. the text encoder after the
+  /// prompts are encoded); it reloads on next use. Also trims the pool.
+  void Evict(std::string_view prefix);
+  /// Return cached pool blocks to HIP. Freed tensors otherwise stay cached
+  /// (up to 8 GB) and push the next phase into shared (host) memory.
+  void Trim();
+  /// Upper bound of freed blocks kept for reuse (default 8 GB).
+  void SetCacheLimit(std::size_t bytes);
+  /// Copy `source` into rows [row, row + source.rows) of `destination`.
+  void CopyRows(const Matrix& destination, int row, const Matrix& source);
   std::size_t WeightBytes() const { return weight_bytes_; }
   hipStream_t stream() const { return stream_; }
 
@@ -131,15 +191,25 @@ private:
   hipblasHandle_t blas_{nullptr};
   Gemm gemm_;
   std::map<std::string, Matrix, std::less<>> device_weights_;
+  std::map<std::string, std::vector<LoraTerm>, std::less<>> loras_;
   std::vector<std::string_view> prefetched_groups_;
   Matrix packed_source_, packed_input_;
   std::size_t weight_bytes_{0};
   // Pinned buffers for weight uploads; see Runtime::UploadMapped.
   std::array<void*, 2> staging_{};
   std::array<hipEvent_t, 2> staging_done_{};
+  /// Device buffers for one weight: `m` in BF16, plus `raw` for F32 sources.
+  struct StagedWeight {
+    Matrix m, raw;
+  };
   Matrix Raw(std::size_t bytes);
   Matrix PackedInput(const Matrix& x);
   void UploadMapped(void* device, const void* host, std::size_t bytes);
+  StagedWeight Stage(const qwen_image_21::Weight& w);
+  bool UploadGroup(std::string_view prefix);
+  Matrix Store(std::string_view name, const qwen_image_21::Weight& w,
+               StagedWeight target);
+  void MergeLoras(Matrix& weight, std::span<const LoraTerm> terms);
   void Matmul(const Matrix& x, const Matrix& w, Matrix& output,
               const Matrix* bias = nullptr, bool convolution = false);
 };

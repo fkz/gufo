@@ -1,16 +1,18 @@
 #ifndef GUFO_MODELS_DEEPSEEK_V4_FLASH_ENGINE_HPP_
 #define GUFO_MODELS_DEEPSEEK_V4_FLASH_ENGINE_HPP_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <gufo/ext/session_mode.hpp>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "src/core/session_mode.hpp"
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
 #include "src/models/deepseek_v4_flash/runtime/model.h"
 
@@ -24,6 +26,7 @@ struct ModelOptions {
 
 class Session;
 class SessionSnapshot;
+class ContinuationAdapter;
 
 struct SessionBatchItem {
   Session* session = nullptr;
@@ -57,6 +60,29 @@ public:
       const std::string& model_path, const ModelOptions& options,
       std::string* error_msg = nullptr);
 
+  /// Creates and drops sessions of `mode` at `max_context` to measure what
+  /// each allocates whole. The batch workspace the first one creates stays
+  /// for the real sessions, so free memory already excludes it afterwards.
+  [[nodiscard]] bool MeasureSessionState(core::SessionMode mode,
+                                         std::uint32_t max_context,
+                                         std::string* error_msg = nullptr);
+  /// New sessions keep compressed rows as before this state accounting:
+  /// managed memory for very large caches, nothing claimed. For
+  /// configurations the device cannot hold even with shared state.
+  void DisableStateRegions();
+  /// Builds the F16 weight copies the prefill routes read, which the first
+  /// prefill would otherwise allocate (gigabytes) inside its request. Call
+  /// once every session exists, so sessions claim memory first.
+  void BuildWeightCopies();
+  /// Worst-case device state of one session at `max_context`, measured by
+  /// MeasureSessionState(): its whole allocations and its demand-mapped
+  /// rows at full context. Empty when not measured at this context.
+  [[nodiscard]] std::optional<std::size_t> SessionBytes(
+      std::uint32_t max_context) const;
+  /// The part of SessionBytes() a session maps only as it writes it
+  /// (compressed rows and the indexer score scratch); zero without demand
+  /// mapping.
+  [[nodiscard]] std::size_t DemandMappedBytes(std::uint32_t max_context) const;
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       core::SessionMode mode, std::uint32_t max_context,
       std::string* error_msg = nullptr);
@@ -91,7 +117,13 @@ private:
 
   ds4_engine* engine_ = nullptr;
   ModelOptions options_;
+  /// MeasureSessionState(): context and bytes allocated whole per session.
+  std::uint32_t measured_context_ = 0;
+  std::size_t measured_fixed_bytes_ = 0;
+  /// Vocabulary IDs indexed by ControlToken, resolved at load.
+  std::array<int, kControlTokenCount> control_tokens_{};
 
+  friend class ContinuationAdapter;
   friend class Session;
 };
 
@@ -149,6 +181,9 @@ public:
     bool operator==(const DsparkStats&) const = default;
   };
   [[nodiscard]] DsparkStats DsparkStatistics() const;
+  /// Valid until the next Evaluate, Sync, step, or restore on this session.
+  [[nodiscard]] std::span<const float> Logits(
+      std::string* error_msg = nullptr) const;
   [[nodiscard]] std::vector<float> CopyLogits(
       std::string* error_msg = nullptr) const;
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
@@ -158,12 +193,21 @@ public:
   [[nodiscard]] bool RestoreSnapshot(std::span<const std::uint8_t> payload,
                                      std::string* error_msg = nullptr);
   void SetCancellationCheck(CancellationCheck is_cancelled);
+  /// Splits the following prefill passes into at most `groups` layer groups
+  /// and calls `yield` between them, where other sessions may decode. One
+  /// group, or an empty `yield`, restores unsplit passes.
+  void SetPrefillYield(std::size_t groups, std::function<void()> yield);
   void Invalidate() noexcept;
 
   [[nodiscard]] int Position() const;
   [[nodiscard]] int ContextSize() const;
   [[nodiscard]] std::uint32_t PrefillCapacity() const;
+  /// Rows of one prefill pass of a session with this context.
+  [[nodiscard]] static std::uint32_t PrefillCapacityFor(int context_size);
   [[nodiscard]] std::uint64_t PayloadBytes() const;
+  /// The account of this session's demand-mapped rows; null without demand
+  /// mapping.
+  [[nodiscard]] std::shared_ptr<mem::StateAccount> StateAccount() const;
 
 private:
   Session(std::shared_ptr<Model> model, ds4_session* session);
@@ -171,7 +215,9 @@ private:
   std::shared_ptr<Model> model_;
   ds4_session* session_ = nullptr;
   CancellationCheck is_cancelled_;
+  std::function<void()> prefill_yield_;
 
+  friend class ContinuationAdapter;
   friend class Model;
 };
 

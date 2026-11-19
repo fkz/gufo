@@ -33,8 +33,8 @@ def published_tokens(log):
 
 
 def wait_until(predicate, description, timeout=30):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
         result = predicate()
         if result:
             return result
@@ -82,10 +82,10 @@ class Lifecycle:
         continuation.TRACE = Recorder(self.stage_path / "requests.requests.json")
         record = {"command": command, "status": "running", "staging_bytes": staging}
         self.row["stages"][name] = record
-        started = time.monotonic()
+        started = time.perf_counter()
         try:
             with server(command, self.stage_path / "server.log", self.timeout, environment) as process:
-                record["startup_ms"] = (time.monotonic() - started) * 1000
+                record["startup_ms"] = (time.perf_counter() - started) * 1000
                 yield process
             join_server_timings(self.stage_path)
             record["execution"] = execution_coverage(self.stage_path, self.mode)
@@ -328,7 +328,7 @@ def main():
     if len(command) < 3 or command[1:3] != ["serve", "llm"]:
         parser.error("pass a gufo serve llm command after --")
     for reserved in ("--host", "--port", "--cache-disk", "--cache-disk-bytes",
-                     "--cache-disk-staging-bytes", "--api-key"):
+                     "--cache-disk-staging-bytes"):
         if option(command, reserved) is not None:
             parser.error(f"the runner owns {reserved}")
     if int(option(command, "--context", "0")) < 32768:

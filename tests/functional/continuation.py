@@ -34,7 +34,7 @@ def call(url, body, stop_field=None):
     target = urlsplit(url)
     cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
     connection = cls(target.hostname, target.port, timeout=180)
-    started = time.monotonic()
+    started = time.perf_counter()
     measurement = TRACE.begin("/v1/chat/completions", body)
     connection.request("POST", target.path.rstrip("/") + "/v1/chat/completions",
                        json.dumps(body), {"Content-Type": "application/json"})
@@ -77,11 +77,18 @@ def call(url, body, stop_field=None):
             response.close()
             connection.close()
             measurement.finish()
-            return message, time.monotonic() - started
+            return message, time.perf_counter() - started
     connection.close()
     measurement.ended = True
-    measurement.finish()
-    raise RuntimeError(f"fixture never reached eight {stop_field} deltas")
+    # The model finished before the fixture could cancel it. Say so even when
+    # the completed stream's own checks fail too: that is the first cause.
+    problem = (f"fixture never cancelled: the model finished after {pieces} of the "
+               f"eight {stop_field} deltas it needed")
+    try:
+        measurement.finish()
+    except ValueError as error:
+        raise RuntimeError(f"{problem} ({error})") from error
+    raise RuntimeError(problem)
 
 
 def digest(result):

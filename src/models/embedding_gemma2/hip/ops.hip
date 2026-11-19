@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "src/models/embedding_gemma2/hip/ops.hpp"
+#include "ops.hpp"
 
 namespace gufo::models::embedding_gemma2::hip {
 namespace {
@@ -182,7 +182,7 @@ __global__ void QkvNormRopeKernel(
 }
 
 using Vec16 = __attribute__((__vector_size__(16))) unsigned int;
-using Fragment = __attribute__((ext_vector_type(16))) unsigned short;
+using Fragment = __attribute__((ext_vector_type(16))) short;
 using Accumulator = __attribute__((ext_vector_type(8))) float;
 
 // Loads 16 contiguous BF16 values. `source` must be 16-byte aligned.

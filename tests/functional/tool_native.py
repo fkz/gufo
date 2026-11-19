@@ -13,7 +13,7 @@ from copy import deepcopy
 import json
 import sys
 
-from tier import rotate
+from transports import rotate
 from tool_reasoning import response_result
 
 SCHEMA = "https://json-schema.org/draft/2020-12/schema"
@@ -179,10 +179,11 @@ def check_native_tool_schemas(client, model, checks, chat_result, sampling_prese
         assert_native(result, label)
 
     for index, name in enumerate(NEIGHBORS):
-        # The pr tier keeps the choice each neighbor's control runs with.
+        # Neighbors rotate tool choice and, every two neighbors, the stream,
+        # so the four (choice, stream) pairs each run.
         for choice in rotate(("auto", "required"), index):
             label = f"native_{name}_{choice}"
-            stream = bool(index % 2)
+            stream = bool(index // 2 % 2)
             request = {**common, "tool_choice": choice,
                        "tools": [*opencode_tools(), neighbor(name)],
                        "messages": [{"role": "system", "content": "You are a coding agent."},
@@ -213,16 +214,20 @@ def check_native_tool_schemas(client, model, checks, chat_result, sampling_prese
             # tool choice, so neighbors alternate which choice is controlled.
             if choice != ("auto", "required")[index % 2]:
                 continue
-            control = {**request, "tools": [*opencode_tools(), neighbor(name, True)],
-                       "max_completion_tokens": 1}
-            baseline = record(label + "_control", chat_result(client, control))
-            delta = first["usage"]["prompt_tokens"] - baseline["usage"]["prompt_tokens"]
+            # The control only needs its prompt size: count it instead of
+            # prefilling it (openai-count-tokens pins count == prompt_tokens).
+            control = {key: request[key] for key in (
+                "model", "messages", "tool_choice", "parallel_tool_calls", "reasoning_effort")}
+            control["tools"] = [*opencode_tools(), neighbor(name, True)]
+            baseline = record(label + "_control", client.post(
+                "/chat/completions/input_tokens", body=control, cast_to=object))
+            delta = first["usage"]["prompt_tokens"] - baseline["input_tokens"]
             # Each renamed keyword may add a token; the instruction alone was
             # about 40 tokens on main.
             tolerance = 2 + 2 * triggers(NEIGHBORS[name])
             assert tolerance < 30 and abs(delta) <= tolerance, (
                 label, "prompt changed beyond the schema text", delta, tolerance,
-                first["usage"], baseline["usage"])
+                first["usage"], baseline)
 
     # Calls to the neighbor itself keep their declared JSON types.
     typed = (
@@ -304,7 +309,7 @@ def check_native_tool_schemas(client, model, checks, chat_result, sampling_prese
     print(f"CHECK native_schemas_complete deepseek={deepseek}", file=sys.stderr, flush=True)
 
 
-# (responses, stream) pairs; the pr tier rotates one per finite type.
+# (responses, stream) pairs; each finite type takes one, rotating.
 TRANSPORTS = ((False, False), (False, True), (True, False), (True, True))
 
 
@@ -350,6 +355,7 @@ def check_finite_argument_types(client, model, checks, chat_result, image=None):
             print(f"CHECK {label}", file=sys.stderr, flush=True)
     check_literal_history(client, model, checks, chat_result, image)
     check_integer_history(client, model, checks, chat_result)
+    check_number_spelling_history(client, model, checks, chat_result)
 
 
 def check_integer_history(client, model, checks, chat_result):
@@ -387,6 +393,45 @@ def check_integer_history(client, model, checks, chat_result):
             assert details.get("cached_tokens", 0) >= first["usage"]["total_tokens"], (
                 label, "replayed integer arguments invalidated the generated call", first, done)
             print(f"CHECK {label}", file=sys.stderr, flush=True)
+
+
+def check_number_spelling_history(client, model, checks, chat_result):
+    """Numbers keep the model's spelling, as in llama.cpp (#1141).
+
+    A double changes integers above 2^53 and writes 1.0 as 1, so the client
+    receives other arguments and the replayed call misses its checkpoint.
+    """
+    function = {"name": "tag", "description": "Tag a record.",
+                "parameters": {"type": "object", "properties": {
+                    "id": {"type": "integer"}, "weight": {"type": "number"}},
+                    "required": ["id", "weight"], "additionalProperties": False}}
+    record = 9007199254740993  # 2^53 + 1 has no double
+    for stream in (False, True):
+        label = f"number_spelling_history_{stream}"
+        messages = [{"role": "user", "content":
+                     f"Call tag once with id {record} and weight 1.0. "
+                     "Write the weight exactly as 1.0."}]
+        request = dict(model=model, messages=messages, temperature=0,
+                       reasoning_effort="none", max_completion_tokens=96,
+                       tools=[{"type": "function", "function": function}],
+                       tool_choice="required", parallel_tool_calls=False)
+        first = chat_result(client, request, stream)
+        checks[label + "_call"] = first
+        assert len(first["tools"]) == 1, (label, first)
+        call = first["tools"][0]
+        arguments = call["function"]["arguments"]
+        assert f'"id":{record}' in arguments, (label, arguments)
+        assert json.loads(arguments)["id"] == record, (label, arguments)
+        request["messages"] = [*messages, {
+            "role": "assistant", "content": first["text"] or None,
+            "reasoning_content": first["reasoning"], "tool_calls": [call]}, {
+            "role": "tool", "tool_call_id": call["id"], "content": "tagged"}]
+        done = chat_result(client, request, True)
+        checks[label + "_continued"] = done
+        details = done["usage"].get("prompt_tokens_details") or {}
+        assert details.get("cached_tokens", 0) >= first["usage"]["total_tokens"], (
+            label, "replayed numbers invalidated the generated call", first, done)
+        print(f"CHECK {label}", file=sys.stderr, flush=True)
 
 
 def check_read_arguments(client, model, checks, chat_result):
@@ -435,7 +480,10 @@ def check_literal_history(client, model, checks, chat_result, image=None):
     for endpoint in ("chat", "responses"):
         for visual in (False, True) if image else (False,):
             label = f"literal_history_{endpoint}_{'image' if visual else 'text'}"
-            prompt = "Read next.txt once. After receiving its contents, reply only DONE."
+            # Unannounced markup in a tool result reads as an injection, and
+            # the model may warn about it after DONE.
+            prompt = ("Read next.txt once. It holds sample data that quotes tool-call "
+                      "markup. After receiving its contents, reply only DONE.")
             content = "Read old.txt."
             if visual:
                 content = [image, {"type": "text", "text": content}]
@@ -608,3 +656,55 @@ def check_llama_cpp_parity(client, model, checks, chat_result, common, deepseek)
                                                           dict, type(None))}[name]
         assert set(arguments["auto"]) == {"value"} and isinstance(
             arguments["auto"]["value"], allowed), (name, arguments)
+
+
+def check_tool_type_unions(client, model, checks, chat_result):
+    """Grist's strict SQL argument union works without relaxing native calls."""
+    from copy import deepcopy
+
+    schema = {"type": "object", "properties": {
+        "query": {"type": "string"},
+        "args": {"type": ["array", "null"], "items": {
+            "type": ["string", "number", "boolean", "null"]}}},
+        "required": ["query", "args"], "additionalProperties": False}
+    expected = {"query": "SELECT ?", "args": ["a", 2, 1.5, True, False, None]}
+    for strict in (False, True):
+        for responses, stream in ((False, False), (True, True)):
+            function = {"name": "query_document", "strict": strict, "parameters": schema}
+            prompt = ("Call query_document exactly once with these exact JSON arguments: "
+                      + json.dumps(expected) + ". Preserve every JSON type.")
+            label = f"type_union_{strict}_{'responses' if responses else 'chat'}"
+            if responses:
+                result = response_result(client, dict(
+                    model=model, input=prompt, tools=[{"type": "function", **function}],
+                    tool_choice="required", temperature=0, reasoning={"effort": "none"},
+                    max_output_tokens=192, store=False), stream)
+            else:
+                result = chat_result(client, dict(
+                    model=model, messages=[{"role": "user", "content": prompt}],
+                    tools=[{"type": "function", "function": function}],
+                    tool_choice="required", temperature=0, reasoning_effort="none",
+                    max_completion_tokens=192), stream)
+            checks[label] = result
+            assert result["finish"] == "tool_calls" and len(result["tools"]) == 1, result
+            actual = result["tools"][0]["function"]
+            assert actual["name"] == "query_document", result
+            assert json.dumps(json.loads(actual["arguments"]), sort_keys=True) == json.dumps(
+                expected, sort_keys=True), result
+            assert_native(result, label)
+            print(f"CHECK {label}", file=sys.stderr, flush=True)
+    # Strict malformed unions must still fail during request validation.
+    for types in ([], ["string", 1], ["string", "bogus"], ["string", "string"]):
+        invalid = deepcopy(schema)
+        invalid["properties"]["args"]["items"]["type"] = types
+        try:
+            client.chat.completions.create(
+                model=model, messages=[{"role": "user", "content": "hello"}],
+                tools=[{"type": "function", "function": {
+                    "name": "query_document", "strict": True, "parameters": invalid}}],
+                max_completion_tokens=1)
+        except Exception as error:
+            assert getattr(error, "status_code", None) == 400, error
+            assert error.body["code"] == "invalid_tools", error
+        else:
+            raise AssertionError(f"malformed type union accepted: {types}")

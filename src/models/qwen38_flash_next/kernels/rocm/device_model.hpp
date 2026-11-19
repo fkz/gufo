@@ -3,12 +3,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/gguf_reader.hpp>
 #include <memory>
 #include <span>
 #include <string>
 #include <vector>
 
-#include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -61,6 +61,31 @@ struct DeviceLayer {
   DeviceMixer nextn_head;
 };
 
+/// How Upload stores a hyper-connection inject projection read in `disk`
+/// format. The binder accepts F32, Q8_0 and BF16 rows, and each reaches the
+/// device as F32 rows for the fused inject kernels, which compute a prompt
+/// row the same way at any pass width. A separate 16-bit projection would
+/// take the library GEMM, whose sums depend on the pass width, and on the
+/// wide HC route it shares the half staging buffer with the mixed row.
+enum class HcInjectUpload { kCopy, kExpandQ8_0, kWidenBF16 };
+
+[[nodiscard]] constexpr HcInjectUpload HcInjectUploadFor(
+    core::GgmlType disk) noexcept {
+  switch (disk) {
+    case core::GgmlType::kQ8_0:
+      return HcInjectUpload::kExpandQ8_0;
+    case core::GgmlType::kBF16:
+      return HcInjectUpload::kWidenBF16;
+    default:
+      return HcInjectUpload::kCopy;
+  }
+}
+
+/// Widens `count` BF16 values to F32 exactly: a BF16 value is the upper half
+/// of an F32.
+void WidenBF16(const std::uint16_t* src, float* dst,
+               std::size_t count) noexcept;
+
 /// The trunk (and optionally the MTP draft block) uploaded to the GPU. The
 /// n-gram table is never uploaded: it is read from disk per token.
 class DeviceModel {
@@ -78,8 +103,9 @@ public:
   const Config& config() const noexcept { return config_; }
   const DeviceTensor& token_embd() const noexcept { return token_embd_; }
   const DeviceTensor& output() const noexcept { return output_; }
-  /// The leading output() rows the MTP draft head scores in place (see
-  /// draft_vocab.hpp); empty when the draft projects the full vocabulary.
+  /// The leading output() rows the MTP draft head scores (see
+  /// draft_vocab.hpp): a Q4_K copy of a Q8_0 head, else those rows in
+  /// place; empty when the draft projects the full vocabulary.
   const DeviceTensor& draft_output() const noexcept { return draft_output_; }
   /// Special tokens above the prefix: the first rows of each session's
   /// draft table.
@@ -90,9 +116,10 @@ public:
   std::size_t output_row_bytes() const noexcept {
     return output_.rows == 0 ? 0 : output_bytes_ / output_.rows;
   }
-  /// Drafts score output() rows [0, prefix_rows) in place plus a
-  /// per-session table that starts with `specials`. Draft proposals only
-  /// steer speculation: the target still verifies every token, so greedy
+  /// Drafts score output() rows [0, prefix_rows) plus a per-session table
+  /// that starts with `specials`. The rows of a Q8_0 head are requantized
+  /// to Q4_K once, here; the table keeps the head's format. Draft proposals
+  /// only steer speculation: the target still verifies every token, so greedy
   /// text is unchanged. Sampled text can differ: a smaller head changes
   /// acceptance, and so the later random draws.
   [[nodiscard]] bool SetDraftVocab(std::uint32_t prefix_rows,
@@ -113,6 +140,7 @@ public:
   }
 
 private:
+  friend struct DeviceModelTestAccess;  // synthetic models in GPU tests
   DeviceModel() = default;
 
   Config config_;

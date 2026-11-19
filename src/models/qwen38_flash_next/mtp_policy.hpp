@@ -13,6 +13,15 @@
 namespace gufo::models::qwen38_flash_next {
 
 inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
+/// A chain ends after its first proposal below its gate: the head's
+/// probability of a greedy draft, or the proposal probability q of a sampled
+/// one.
+inline constexpr float kMtpGateProbability = 0.85F;
+inline constexpr float kMtpSampledGateProbability = 0.95F;
+/// In a jointly planned greedy batch a final proposal below this
+/// probability is not verified: its row costs a C8 cycle more than the
+/// expected accepted token returns.
+inline constexpr float kMtpBatchDropProbability = 0.6F;
 
 /// The occupancy an unplanned draft cycle is priced at, or 0 for the
 /// configured session count. Greedy output does not depend on the width, and
@@ -79,7 +88,8 @@ public:
 
   void Observe(std::size_t accepted, std::size_t drafted,
                std::uint32_t context = 0, std::uint32_t concurrency = 0,
-               bool sampled_subset = false) noexcept {
+               bool sampled_subset = false,
+               bool recover_backoff = false) noexcept {
     if (drafted == 0)
       return;
     drafted = std::min<std::size_t>(drafted, limit_);
@@ -108,6 +118,12 @@ public:
       state_.failed_depths |= 1U << accepted;
     if (BestLength(limit_, context, concurrency, sampled_subset) == 0)
       state_.retry_tokens = 16;
+    else if (recover_backoff)
+      // A jointly planned greedy batch can keep observing neural proposals
+      // while the session's older AR backoff is active. Profitable new
+      // evidence supersedes that decision before the session decodes alone.
+      // Ordinary and sampled callers retain their established AR interval.
+      state_.retry_tokens = 0;
   }
 
   void ObserveArToken() noexcept {

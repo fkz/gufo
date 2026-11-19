@@ -29,8 +29,11 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "libpng",
     "libjpeg-turbo",
     "libwebp",
-    "libsndfile",
-    "libsoxr",
+    "libopus",
+    "httparse (Rust crate)",
+    "png (Rust crate)",
+    "Rust standard library and crates",
+    "symphonia (Rust crates)",
     "DS4",
     "h3.c",
     "ccv TensorOps ancestry",
@@ -125,7 +128,8 @@ def verify_dependencies(
                     f"{flake_nix_file.name}"
                 )
         for binding in (
-            "torch = ps.torchWithRocm",
+            "torchRocm = ps.torchWithRocm",
+            "torch = torchRocm",
             "torchvision = torchvisionRocm",
             "alexnet-owt-7be5be79.pth",
             "TORCH_HOME",

@@ -19,15 +19,21 @@ using TokenId = std::uint32_t;
 /// sampler (#266). Tokens are counted after the reasoning start, including
 /// reasoning text already in the prompt. Once the budget is spent, and the
 /// last token completed its UTF-8 character, `forced` is emitted token by
-/// token. Any token in `ends` closes reasoning early. Later tokens are answer
+/// token. Any token in `ends` closes reasoning early, as does the request's
+/// constraint grammar leaving its reasoning phase. Later tokens are answer
 /// content, including literal reasoning tags, as in Gufo's response framing.
 struct ReasoningBudget {
   std::size_t tokens{0};
   std::vector<TokenId> forced;
   std::vector<TokenId> ends;
   std::vector<TokenId> prompt;
+  /// Set when the output opens reasoning itself: the budget starts after this
+  /// token, and never if anything but `blank` tokens precedes it.
+  std::optional<TokenId> opener;
   /// Indexed by token: its text ends inside a UTF-8 character.
   std::shared_ptr<const std::vector<bool>> partial_utf8;
+  /// Indexed by token: its text is only whitespace.
+  std::shared_ptr<const std::vector<bool>> blank;
 };
 
 /// Model-independent controls for selecting a token from a logit row.
@@ -35,6 +41,8 @@ struct ReasoningBudget {
 /// Filters run in this order: penalties, temperature, top-k, top-p, min-p.
 /// The defaults preserve Gufo's existing greedy decoding behavior.
 struct SamplingConfig {
+  /// Observational raw target log probabilities; null disables collection.
+  std::optional<std::uint32_t> logprobs;
   float temperature{0.0F};
   std::int32_t top_k{0};
   float top_p{1.0F};
@@ -46,7 +54,7 @@ struct SamplingConfig {
   float frequency_penalty{0.0F};
   float presence_penalty{0.0F};
   std::shared_ptr<const TokenConstraint> constraint;
-  /// Set only for requests that start in their reasoning phase.
+  /// Set only for requests whose output starts in, or may open, reasoning.
   std::shared_ptr<const ReasoningBudget> reasoning_budget;
 
   void Validate() const;
@@ -72,6 +80,21 @@ struct LogitCandidate {
   TokenId token;
   float value;
 };
+
+struct TokenLogprob {
+  TokenId token{0};
+  double logprob{0};
+};
+
+struct TokenLogprobs {
+  TokenLogprob selected;
+  std::vector<TokenLogprob> top;
+};
+
+/// Full-vocabulary log-softmax before any sampling transformations.
+[[nodiscard]] std::optional<TokenLogprobs> CollectLogprobs(
+    std::span<const float> logits, TokenId selected,
+    std::optional<std::uint32_t> count);
 
 /// A normalized, post-filter sampling distribution.
 class SamplingDistribution {
@@ -100,6 +123,12 @@ private:
     std::span<const float> logits, const SamplingConfig& config,
     std::span<const TokenId> prompt_tokens = {},
     std::span<const TokenId> generated_tokens = {});
+
+/// Buffers the full-row sampler reuses across tokens; not part of the API.
+struct LogitRowScratch {
+  std::vector<std::uint32_t> histogram;
+  std::vector<double> block_maxima;
+};
 
 /// Request-owned controls, repetition window, full generated counts and RNG.
 ///
@@ -192,10 +221,10 @@ private:
   [[nodiscard]] SamplingDistribution LinearDistribution(
       std::span<const float> logits) const;
   void PrepareSelected(std::span<const float> logits);
-  void FilterSelected(double full_softmax_sum = 0,
-                      bool has_full_softmax_sum = false);
+  void FilterSelected(std::optional<std::size_t> top_p_keep = std::nullopt);
   [[nodiscard]] SamplingDistribution SelectedDistribution();
   void StartReasoning();
+  void OpenReasoning();
   void AdvanceReasoning(TokenId token);
 
   SamplingConfig config_;
@@ -205,10 +234,12 @@ private:
   std::vector<TokenId> history_;
   std::vector<TokenPenalty> penalty_counts_;
   std::vector<Probability> candidate_scratch_;
+  LogitRowScratch row_scratch_;
   std::uint64_t rng_state_{0};
   std::optional<TokenId> pending_sample_;
   enum class ReasoningPhase : std::uint8_t {
     kOff,
+    kWaitingOpen,
     kCounting,
     kWaitingUtf8,
     kForcing,

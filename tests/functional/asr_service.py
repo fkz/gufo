@@ -46,6 +46,13 @@ def run(evidence, url, audio_root, model):
             files={'file': ('speech.wav', item['path'].read_bytes(), 'audio/wav')})
         assert status == 200 and body.decode().strip() == references[0].strip(), body
 
+    with evidence.case('mp3-equals-wav'):
+        # #1257: compressed uploads decode to the same speech as the WAV.
+        mp3 = item['path'].with_suffix('.mp3')
+        result = evidence.json(endpoint, label='mp3', data=fields(item),
+                               files={'file': ('speech.mp3', mp3.read_bytes(), 'audio/mpeg')})
+        assert result['text'] == references[0], result
+
     with evidence.case('streaming-equals-buffered'):
         with evidence.request(endpoint, label='stream', data=fields(item, stream='true'),
                 files={'file': ('speech.wav', item['path'].read_bytes(), 'audio/wav')}) as (response, row, path):
@@ -75,20 +82,23 @@ def run(evidence, url, audio_root, model):
             assert speech.result()['text'] == references[0]
             assert not silence.result()['text'].strip()
 
+    with evidence.case('unknown-fields-ignored'):
+        # #724: as in llama.cpp and vLLM, fields the server does not use are
+        # ignored rather than refused.
+        assert request(item, 'unknown-fields', chunking_strategy='auto',
+                       client_tag='functional')['text'] == references[0]
+
     with evidence.case('rejections-and-recovery'):
         for options, code in [({'model': 'unknown'}, 'invalid_model'),
                               ({'temperature': '1'}, 'invalid_temperature'),
                               ({'response_format': 'srt'}, 'invalid_response_format'),
-                              ({'max_tokens': '0'}, 'invalid_max_tokens')]:
+                              ({'max_tokens': '0'}, 'invalid_max_tokens'),
+                              ({'timestamp_granularities[]': 'word'}, 'unsupported_option'),
+                              ({'include[]': 'logprobs'}, 'unsupported_option')]:
             evidence.reject(endpoint, code, label=code, data=fields(item, **options),
                 files={'file': ('speech.wav', item['path'].read_bytes(), 'audio/wav')})
-        status, body, _ = evidence.call(endpoint, label='malformed-audio', data={'model': model},
-            files={'file': ('broken.wav', b'not a WAV', 'audio/wav')})
-        # Current API maps native WAV decode failures to transcription_failed.
-        # Keep this limitation explicit rather than accepting arbitrary errors.
-        assert status == 500 and json.loads(body)['error']['code'] == 'transcription_failed', (status, body)
-        evidence.report['known_limitations'] = [
-            'Malformed WAV returns HTTP 500 transcription_failed rather than HTTP 400.']
+        evidence.reject(endpoint, 'invalid_audio_input', label='malformed-audio',
+            data={'model': model}, files={'file': ('broken.wav', b'not a WAV', 'audio/wav')})
         assert request(item, 'recovered')['text'] == references[0]
 
     with evidence.case('cancel-stream-and-recover'):

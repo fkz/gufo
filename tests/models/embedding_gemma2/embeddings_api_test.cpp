@@ -1,7 +1,5 @@
 // POST /v1/embeddings contract against a fake encoder: no model files, no
 // device, and no socket. The test calls the HTTP handler directly.
-#include "src/cli/serve/embeddings_api.hpp"
-
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -24,8 +22,8 @@
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/embedding_service.hpp"
 #include "src/core/json.hpp"
+#include "tests/support/model_api_test_support.hpp"
 
 namespace {
 
@@ -87,6 +85,7 @@ struct FakeRunner {
     ++calls;
     last_texts = texts;
     last_truncate = request.truncate;
+    last_image_soft_tokens = request.image_soft_tokens;
     for (std::size_t i = 0; i < texts.size(); ++i) {
       if (texts[i].starts_with("TOOLONG")) {
         if (request.truncate) {
@@ -114,6 +113,7 @@ struct FakeRunner {
   int calls{0};
   std::vector<std::string> last_texts;
   bool last_truncate{false};
+  std::uint32_t last_image_soft_tokens{0};
 };
 
 std::unique_ptr<EmbeddingService> MakeService(FakeRunner* runner) {
@@ -427,8 +427,6 @@ void TestInputValidation() {
               "invalid_parameter_type", "boolean item");
   ExpectError(Send(*service, R"({"input":"x","user":3})"), 400,
               "invalid_parameter_type", "non-string user");
-  ExpectError(Send(*service, R"({"input":"x","normalize":true})"), 400,
-              "unsupported_field", "unknown member");
 
   std::string many = R"({"input":[)";
   for (int i = 0; i < 2049; ++i) {
@@ -446,6 +444,8 @@ void TestInputValidation() {
             Parse(accepted).find("data")->items().size() == 2048U,
         "2048 inputs are accepted");
   Check(runner.calls == 1, "rejected requests never reach the encoder");
+  Check(Send(*service, R"({"input":"x","normalize":true})").status == 200,
+        "unknown members are ignored, as in llama.cpp, TEI and vLLM");
 }
 
 void TestModelAndJson() {
@@ -520,6 +520,7 @@ void TestLimitsAndFailures() {
 
 void TestTypedInput() {
   std::vector<EmbeddingInput> captured;
+  gufo::server::EmbeddingRequestOptions captured_options;
   EmbeddingService service(EmbeddingServiceOptions{
       .model_root = {},
       .validate_model = false,
@@ -527,9 +528,10 @@ void TestTypedInput() {
       .prompts = {},
       .default_prompt_name = {},
       .runner = [&](const std::vector<EmbeddingInput>& inputs,
-                    const gufo::server::EmbeddingRequestOptions&,
+                    const gufo::server::EmbeddingRequestOptions& options,
                     EmbeddingBatch* batch, std::string*) {
         captured = inputs;
+        captured_options = options;
         for (std::size_t i = 0; i < inputs.size(); ++i) {
           batch->embeddings.push_back(FakeEmbedding(std::to_string(i)));
           batch->token_counts.push_back(i + 2);
@@ -607,6 +609,52 @@ void TestTypedInput() {
   many += "]}]}";
   ExpectError(Send(service, many), 400, "too_many_images",
               "image count bounded before reading");
+  Check(
+      Send(
+          service,
+          R"({"input":[{"content":[{"type":"text","text":"before"},{"type":"input_video","input_video":{"data":"AAAA","url":"ignored"}},{"type":"text","text":"after"}]}],"video_options":{"fps":0.5,"max_frames":3,"add_timestamps":true,"overflow_strategy":"truncate","max_soft_tokens":560}})")
+              .status == 200,
+      "video content and controls accepted");
+  Check(captured[0].content.size() == 3 &&
+            captured[0].content[1].type == EmbeddingPart::Type::kVideo &&
+            captured[0].content[1].value == "AAAA" &&
+            captured[0].content[0].value == "before" &&
+            captured[0].content[2].value == "after",
+        "video data precedence and interleaving");
+  Check(captured_options.video.fps == 0.5 &&
+            captured_options.video.max_frames == 3 &&
+            captured_options.video.timestamps &&
+            captured_options.video.truncate_overflow &&
+            captured_options.video.max_soft_tokens == 560 &&
+            captured_options.image_soft_tokens == 280,
+        "video controls reach runtime");
+  for (
+      const auto* body :
+      {R"({"input":[{"content":[{"type":"input_video","input_video":{}}]}]})",
+       R"({"input":[{"content":[{"type":"input_video","input_video":{"data":3}}]}]})",
+       R"({"input":[{"content":[{"type":"input_video","input_video":{"url":"x","extra":"x"}}]}]})"})
+    ExpectError(Send(service, body), 400, "invalid_parameter_type",
+                "invalid video schema");
+  for (const auto* settings :
+       {R"({"fps":0})", R"({"fps":121})", R"({"max_frames":0})",
+        R"({"max_frames":33})", R"({"max_frames":1.5})",
+        R"({"add_timestamps":1})", R"({"overflow_strategy":"other"})",
+        R"({"max_soft_tokens":100})", R"({"max_soft_tokens":0})",
+        R"({"max_soft_tokens":280.5})", R"({"max_soft_tokens":"280"})",
+        R"({"max_soft_tokens":2240})", R"({"unknown":true})"})
+    ExpectError(
+        Send(service, std::string(R"({"input":"hello","video_options":)") +
+                          settings + "}"),
+        400, "invalid_video_options", "invalid video control");
+  std::string video_many = R"({"input":[{"content":[)";
+  for (int i = 0; i < 33; ++i) {
+    if (i)
+      video_many += ',';
+    video_many += R"({"type":"input_video","input_video":{"data":"AAAA"}})";
+  }
+  video_many += "]}]}";
+  ExpectError(Send(service, video_many), 400, "too_many_videos",
+              "video request count bound");
 }
 
 // #764: llama.cpp's non-OpenAI `POST /embeddings`, as Frigate 0.18 sends it
@@ -774,16 +822,15 @@ void TestNativeEmbeddings() {
   ExpectError(SendTo(service, "/embeddings",
                      R"({"content":"y","encoding_format":"int8"})"),
               400, "invalid_encoding_format", "encoding_format is validated");
-  ExpectError(
-      SendTo(service, "/embeddings", R"({"content":"y","pooling":"none"})"),
-      400, "unsupported_field", "unknown native fields are rejected");
   Check(calls == before, "rejected native requests never reach the runner");
-  // The OpenAI route keeps its own field set.
-  ExpectError(Send(service, R"({"content":"y"})"), 400, "unsupported_field",
-              "/v1/embeddings does not take content");
-  ExpectError(Send(service, R"({"input":"y","embd_normalize":2})"), 400,
-              "unsupported_field",
-              "/v1/embeddings does not take embd_normalize");
+  // As in llama.cpp, both routes take `content` and `embd_normalize`, and
+  // `content` without `input` selects the native response.
+  ExpectError(Send(service, R"({"input":"y","embd_normalize":0})"), 400,
+              "unsupported_embd_normalize",
+              "/v1/embeddings validates embd_normalize");
+  const HttpResponse content = Send(service, R"({"content":"y"})");
+  Check(content.status == 200 && Parse(content).is_array(),
+        "/v1/embeddings content returns the native form");
   ExpectError(Send(service, R"({"input":[{"prompt_string":"y"}]})"), 400,
               "invalid_parameter_type",
               "/v1/embeddings does not take prompt objects");
@@ -880,6 +927,70 @@ void TestTruncate() {
   Check(runner.calls == calls, "an invalid truncate never reaches the service");
   Check(Send(*service, R"({"input":"a","truncate":null})").status == 200,
         "a null truncate is absent");
+}
+
+// #763: `mm_processor_kwargs.max_soft_tokens` selects the image budget, as
+// in vLLM's embedding requests; the default is the checkpoint's 280.
+void TestImageSoftTokens() {
+  FakeRunner runner;
+  auto service = MakeService(&runner);
+  Check(Send(*service, R"({"input":"a"})").status == 200, "default request");
+  Check(runner.last_image_soft_tokens == 280, "the default budget is 280");
+  for (const std::uint32_t budget : {70U, 140U, 280U, 560U, 1120U}) {
+    const auto response = Send(
+        *service, R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":)" +
+                      std::to_string(budget) + "}}");
+    Check(response.status == 200, "a supported budget is accepted");
+    Check(runner.last_image_soft_tokens == budget,
+          "the budget reaches the service");
+  }
+  Check(
+      SendTo(*service, "/embeddings",
+             R"({"content":"a","mm_processor_kwargs":{"max_soft_tokens":70}})")
+              .status == 200,
+      "the native form accepts the budget");
+  Check(runner.last_image_soft_tokens == 70, "the native budget is applied");
+  Check(Send(*service, R"({"input":"a","mm_processor_kwargs":null})").status ==
+            200,
+        "null mm_processor_kwargs is absent");
+  Check(runner.last_image_soft_tokens == 280, "null keeps the default");
+  Check(
+      Send(*service, R"({"input":"a","mm_processor_kwargs":{}})").status == 200,
+      "empty mm_processor_kwargs keeps the default");
+  const int calls = runner.calls;
+  ExpectError(Send(*service, R"({"input":"a","mm_processor_kwargs":[]})"), 400,
+              "invalid_parameter_type", "mm_processor_kwargs is an object");
+  for (const char* body :
+       {R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":281}})",
+        R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":0}})",
+        R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":-70}})",
+        R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":null}})",
+        R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":true}})",
+        R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":[]}})",
+        R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":{}}})",
+        R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":1121}})",
+        R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":280.5}})",
+        R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":"280"}})",
+        R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":4294967576}})",
+        R"({"input":"a","mm_processor_kwargs":{"fps":2}})"}) {
+    ExpectError(Send(*service, body), 400, "invalid_mm_processor_kwargs",
+                std::string("refused: ") + body);
+  }
+  Check(runner.calls == calls, "invalid kwargs never reach the service");
+  Check(
+      Send(
+          *service,
+          R"({"input":"a","mm_processor_kwargs":{"max_soft_tokens":70},"video_options":{"fps":0.5,"max_frames":3}})")
+              .status == 200,
+      "image and video processor options coexist");
+  Check(runner.last_image_soft_tokens == 70,
+        "video options do not override the image budget");
+  Check(Send(*service,
+             R"({"input":"a","video_options":{"max_soft_tokens":1120}})")
+                .status == 200,
+        "a video budget alone is accepted");
+  Check(runner.last_image_soft_tokens == 280,
+        "a video budget does not change the image default");
 }
 
 // The native path's cut for inputs with images: 2 = <bos>, 1 = <eos>,
@@ -1198,6 +1309,7 @@ int main() {
   TestNativeReferenceFixture();
   TestTruncate();
   TestTruncateKeepingImages();
+  TestImageSoftTokens();
   TestPromptNames();
   TestCancellation();
   TestServiceLifecycle();
