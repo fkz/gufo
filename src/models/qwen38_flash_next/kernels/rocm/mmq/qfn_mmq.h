@@ -25,6 +25,15 @@ int qfn_mmq_q8_0_dense(
     int           K,
     hipStream_t  stream);
 
+int qfn_mmq_q4_K_dense(
+    const void  * W_q4_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    hipStream_t  stream);
+
 int qfn_mmq_q4_K_moe_pair_unique(const void* W_a, const void* W_b,
                                  const float* X_f32, const int32_t* ids,
                                  float* out_a, float* out_b, int M, int K,
@@ -63,6 +72,10 @@ int qfn_mmq_quantize_q8_1(const float* X_f32, void* X_q8, int N, int K,
 // The 320×10240 HC projection also accepts larger multiples of eight.
 // Only N output rows are written.
 int qfn_mmq_q8_0_dense_vec_preq(const void* W_q8_0, const void* W_gate,
+                                const void* X_q8, float* out_f32, int M, int N,
+                                int K, hipStream_t stream);
+
+int qfn_mmq_q4_K_dense_vec_preq(const void* W_q4_K, const void* W_gate,
                                 const void* X_q8, float* out_f32, int M, int N,
                                 int K, hipStream_t stream);
 

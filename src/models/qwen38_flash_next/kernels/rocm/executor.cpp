@@ -2064,15 +2064,23 @@ void Executor::AdoptYarnFactor(Session& s, float factor) {
 
 bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                      std::string* error_msg) const {
-  if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
+  if ((w.type == GgmlType::kQ8_0 || w.type == GgmlType::kQ4_K) &&
+      q.data != nullptr) {
     if (w.cols != q.k) {
       AssignError(error_msg, "quantized input width mismatch");
       return false;
     }
-    if (qfn_mmq_q8_0_dense_vec_preq(
-            w.data, nullptr, q.data, out, static_cast<int>(w.rows),
-            static_cast<int>(q.n), static_cast<int>(w.cols), stream_) != 0) {
-      AssignError(error_msg, "Q8_0 GEMV failed");
+    const int rc =
+        w.type == GgmlType::kQ4_K
+            ? qfn_mmq_q4_K_dense_vec_preq(
+                  w.data, nullptr, q.data, out, static_cast<int>(w.rows),
+                  static_cast<int>(q.n), static_cast<int>(w.cols), stream_)
+            : qfn_mmq_q8_0_dense_vec_preq(
+                  w.data, nullptr, q.data, out, static_cast<int>(w.rows),
+                  static_cast<int>(q.n), static_cast<int>(w.cols), stream_);
+    if (rc != 0) {
+      AssignError(error_msg, w.type == GgmlType::kQ4_K ? "Q4_K GEMV failed"
+                                                       : "Q8_0 GEMV failed");
       return false;
     }
     return true;
@@ -2086,18 +2094,27 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           std::string* error_msg) const {
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
-  if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
-      gate.type == GgmlType::kQ8_0 && up.rows == gate.rows &&
-      up.cols == gate.cols) {
+  if (!MatrixRows(n_tokens) &&
+      (up.type == GgmlType::kQ8_0 || up.type == GgmlType::kQ4_K) &&
+      gate.type == up.type && up.rows == gate.rows && up.cols == gate.cols) {
     Q8Input xq;
     if (!Quantize(x, n_tokens, up.cols, &xq, error_msg)) {
       return false;
     }
-    if (qfn_mmq_q8_0_dense_vec_preq(up.data, gate.data, xq.data, out,
-                                    static_cast<int>(up.rows),
-                                    static_cast<int>(n_tokens),
-                                    static_cast<int>(up.cols), stream_) != 0) {
-      AssignError(error_msg, "gated Q8_0 GEMV failed");
+    const int rc =
+        up.type == GgmlType::kQ4_K
+            ? qfn_mmq_q4_K_dense_vec_preq(up.data, gate.data, xq.data, out,
+                                          static_cast<int>(up.rows),
+                                          static_cast<int>(n_tokens),
+                                          static_cast<int>(up.cols), stream_)
+            : qfn_mmq_q8_0_dense_vec_preq(up.data, gate.data, xq.data, out,
+                                          static_cast<int>(up.rows),
+                                          static_cast<int>(n_tokens),
+                                          static_cast<int>(up.cols), stream_);
+    if (rc != 0) {
+      AssignError(error_msg, up.type == GgmlType::kQ4_K
+                                 ? "gated Q4_K GEMV failed"
+                                 : "gated Q8_0 GEMV failed");
       return false;
     }
     return true;
@@ -2158,14 +2175,15 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
   if (w.type == GgmlType::kQ4_K) {
-    // The draft head (DeviceModel::SetDraftVocab) as one routed expert:
-    // every row's logits are the same at any batch width.
-    if (n_tokens > kDraftHeadRows || s_.draft_head_ids == nullptr ||
-        qfn_mmq_moe_vec(static_cast<int>(GgmlType::kQ4_K), w.data, x,
-                        s_.draft_head_ids, out, static_cast<int>(w.rows),
-                        static_cast<int>(w.cols), static_cast<int>(n_tokens), 1,
-                        1, stream_) != 0) {
-      AssignError(error_msg, "Q4_K draft head projection failed");
+    if (!MatrixRows(n_tokens)) {
+      Q8Input q;
+      return Quantize(x, n_tokens, w.cols, &q, error_msg) &&
+             Dense(w, q, out, error_msg);
+    }
+    if (qfn_mmq_q4_K_dense(w.data, x, out, static_cast<int>(w.rows),
+                           static_cast<int>(n_tokens), static_cast<int>(w.cols),
+                           stream_) != 0) {
+      AssignError(error_msg, "Q4_K dense GEMM failed");
       return false;
     }
     return true;

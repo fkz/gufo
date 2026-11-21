@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <gufo/ext/experimental/managed_alloc.hpp>
 #include <gufo/ext/experimental/weight_upload.hpp>
@@ -564,6 +566,89 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::erase(m->allocations_, c.source);
     (void)hipFree(c.source);
     m->bytes_ -= c.source_bytes + kTailMargin;
+  }
+  if (const char* env = std::getenv("GUFO_QWEN_DENSE_Q4K");
+      env != nullptr && *env != '\0' && std::strcmp(env, "off") != 0 &&
+      std::strcmp(env, "0") != 0) {
+    const bool do_attn_ssm =
+        std::strcmp(env, "attn_ssm") == 0 || std::strcmp(env, "plus_hc") == 0 ||
+        std::strcmp(env, "all") == 0 || std::strcmp(env, "1") == 0;
+    const bool do_hc =
+        std::strcmp(env, "plus_hc") == 0 || std::strcmp(env, "all") == 0;
+    const bool do_output = std::strcmp(env, "all") == 0;
+    std::size_t count = 0;
+    std::size_t q8_total = 0;
+    std::size_t q4_total = 0;
+    const auto requant = [&](DeviceTensor& t) -> bool {
+      if (t.empty() || t.type != core::GgmlType::kQ8_0 || t.experts != 1 ||
+          t.cols == 0 || (t.cols % 256) != 0) {
+        return true;
+      }
+      const std::size_t q8_bytes =
+          std::size_t{t.rows} * (t.cols / 32) * 34;
+      const std::size_t q4_bytes =
+          std::size_t{t.rows} * (t.cols / 256) * 144;
+      void* q4k = nullptr;
+      if (hipMalloc(&q4k, q4_bytes + kTailMargin) != hipSuccess) {
+        if (error_msg != nullptr) {
+          *error_msg = "device allocation failed for Q4_K dense requant";
+        }
+        return false;
+      }
+      QuantizeQ8_0ToQ4K(t.data, q4k, t.rows, t.cols, nullptr);
+      if (hipMemsetAsync(static_cast<std::uint8_t*>(q4k) + q4_bytes, 0,
+                         kTailMargin, nullptr) != hipSuccess ||
+          hipStreamSynchronize(nullptr) != hipSuccess) {
+        (void)hipFree(q4k);
+        if (error_msg != nullptr) {
+          *error_msg = "Q4_K dense requantization failed";
+        }
+        return false;
+      }
+      std::erase(m->allocations_, t.data);
+      (void)hipFree(t.data);
+      m->allocations_.push_back(q4k);
+      m->bytes_ = m->bytes_ - (q8_bytes + kTailMargin) + (q4_bytes + kTailMargin);
+      t.data = q4k;
+      t.type = core::GgmlType::kQ4_K;
+      ++count;
+      q8_total += q8_bytes;
+      q4_total += q4_bytes;
+      return true;
+    };
+    for (auto& l : m->layers_) {
+      if (do_attn_ssm) {
+        if (!requant(l.ssm_in) || !requant(l.ssm_qkv) || !requant(l.ssm_gate) ||
+            !requant(l.ssm_out) || !requant(l.attn_qkv) || !requant(l.attn_q) ||
+            !requant(l.attn_k) || !requant(l.attn_v) || !requant(l.attn_out) ||
+            !requant(l.shexp_gate) || !requant(l.shexp_up)) {
+          return nullptr;
+        }
+      }
+      if (do_hc) {
+        if (!requant(l.hc_attn.down) || !requant(l.hc_ffn.down)) {
+          return nullptr;
+        }
+      }
+    }
+    if (do_hc && !requant(m->hc_head_.down)) {
+      return nullptr;
+    }
+    if (do_output && m->output_.data != m->token_embd_.data &&
+        m->output_.type == core::GgmlType::kQ8_0 && (m->output_.cols % 256) == 0) {
+      const std::size_t q4_bytes =
+          std::size_t{m->output_.rows} * (m->output_.cols / 256) * 144;
+      if (!requant(m->output_)) {
+        return nullptr;
+      }
+      m->output_bytes_ = q4_bytes;
+    }
+    std::fprintf(stderr,
+                 "qwen38_flash_next: dense Q4_K mode=%s requantized %zu tensors "
+                 "(%.1f MiB -> %.1f MiB, saved %.1f MiB/tok)\n",
+                 env, count, static_cast<double>(q8_total) / (1024.0 * 1024.0),
+                 static_cast<double>(q4_total) / (1024.0 * 1024.0),
+                 static_cast<double>(q8_total - q4_total) / (1024.0 * 1024.0));
   }
   return m;
 }

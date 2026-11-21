@@ -766,6 +766,188 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
   }
 }
 
+// Unpack-once multi-token dense Q4_K GEMV:
+// - 4 waves (4 rows) per workgroup for full CU wave occupancy on 4-CU gfx1152.
+// - Each Q4_K superblock fragment (4-bit nibbles, 6-bit scales/mins, half2 dm)
+//   is loaded and unpacked ONCE outside the token loop, then reused across all
+//   ncols_dst tokens using block_q8_1::ds.y for the min term (same as MMQ).
+// - Uses scatter_reduce_sum for ncols_dst > 1.
+template<int ncols_dst, bool has_gate>
+__launch_bounds__(128) static __global__
+    void mul_mat_vec_q4_k_dense(const void* __restrict__ weights,
+                                const void* __restrict__ gate,
+                                const block_q8_1* __restrict__ input,
+                                float* __restrict__ output,
+                                const uint32_t ncols_x, const uint32_t nrows_x,
+                                const uint32_t stride_col_y) {
+  constexpr int qk = QK_K;
+  constexpr int qi = QI4_K;
+  constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+  constexpr int blocks_per_iter = vdr * 32 / qi;  // 2
+  const int lane = threadIdx.x;
+  const uint32_t row = blockIdx.x * 4u + threadIdx.y;
+  if (row >= nrows_x) {
+    return;
+  }
+  const int blocks_per_row = ncols_x / qk;
+  const int row_offset = static_cast<int>(row) * blocks_per_row;
+  const int local = lane & 15;
+  const int offset = QR4_K * (local >> 2);  // 0, 2, 4, 6
+  const int q_off = local & 3;              // 0, 1, 2, 3
+  const int scale_pair = offset >> 1;       // 0, 1, 2, 3
+  const float min_weight = (q_off == 0) ? 1.0f : 0.0f;
+
+  float sum[ncols_dst] = {};
+  float gate_sum[ncols_dst] = {};
+
+  for (int kbx = lane >> 4; kbx < blocks_per_row; kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+
+    // Load and unpack weights ONCE for all tokens in this wave.
+    const block_q4_K* w =
+        static_cast<const block_q4_K*>(weights) + row_offset + kbx;
+    const int* wq =
+        reinterpret_cast<const int*>(w->qs + 16 * offset + 4 * q_off);
+    const int wv0 = wq[0];
+    const int wv1 = wq[4];
+    const int v0_0 = wv0 & 0x0F0F0F0F;
+    const int v1_0 = wv1 & 0x0F0F0F0F;
+    const int v0_1 = (wv0 >> 4) & 0x0F0F0F0F;
+    const int v1_1 = (wv1 >> 4) & 0x0F0F0F0F;
+    uint16_t aux[2];
+    q4_K_scale_pair(w, scale_pair, aux);
+    const uint8_t* sc = reinterpret_cast<const uint8_t*>(aux);
+    const float2 dm4f = __half22float2(w->dm);
+    const float ds0 = dm4f.x * static_cast<float>(sc[0]);
+    const float ds1 = dm4f.x * static_cast<float>(sc[1]);
+    const float mm0 = min_weight * dm4f.y * static_cast<float>(sc[2]);
+    const float mm1 = min_weight * dm4f.y * static_cast<float>(sc[3]);
+
+    int gv0_0 = 0, gv1_0 = 0, gv0_1 = 0, gv1_1 = 0;
+    float gds0 = 0.0f, gds1 = 0.0f, gmm0 = 0.0f, gmm1 = 0.0f;
+    if constexpr (has_gate) {
+      const block_q4_K* gw =
+          static_cast<const block_q4_K*>(gate) + row_offset + kbx;
+      const int* gwq =
+          reinterpret_cast<const int*>(gw->qs + 16 * offset + 4 * q_off);
+      const int gwv0 = gwq[0];
+      const int gwv1 = gwq[4];
+      gv0_0 = gwv0 & 0x0F0F0F0F;
+      gv1_0 = gwv1 & 0x0F0F0F0F;
+      gv0_1 = (gwv0 >> 4) & 0x0F0F0F0F;
+      gv1_1 = (gwv1 >> 4) & 0x0F0F0F0F;
+      uint16_t gaux[2];
+      q4_K_scale_pair(gw, scale_pair, gaux);
+      const uint8_t* gsc = reinterpret_cast<const uint8_t*>(gaux);
+      const float2 gdm4f = __half22float2(gw->dm);
+      gds0 = gdm4f.x * static_cast<float>(gsc[0]);
+      gds1 = gdm4f.x * static_cast<float>(gsc[1]);
+      gmm0 = min_weight * gdm4f.y * static_cast<float>(gsc[2]);
+      gmm1 = min_weight * gdm4f.y * static_cast<float>(gsc[3]);
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+      const block_q8_1* b0 = input + j * stride_col_y + kby + offset;
+      const block_q8_1* b1 = b0 + 1;
+      const float2 ds8_0 = __half22float2(b0->ds);
+      const float2 ds8_1 = __half22float2(b1->ds);
+      const int* q8_0 = reinterpret_cast<const int*>(b0->qs) + q_off;
+      const int* q8_1 = reinterpret_cast<const int*>(b1->qs) + q_off;
+      const int u0 = q8_0[0];
+      const int u1 = q8_0[4];
+      const int u2 = q8_1[0];
+      const int u3 = q8_1[4];
+
+      const int dot0 = ggml_hip_dp4a(v1_0, u1, ggml_hip_dp4a(v0_0, u0, 0));
+      const int dot1 = ggml_hip_dp4a(v1_1, u3, ggml_hip_dp4a(v0_1, u2, 0));
+      sum[j] = __fmaf_rn(ds8_0.x * static_cast<float>(dot0), ds0,
+                         __fmaf_rn(-ds8_0.y, mm0, sum[j]));
+      sum[j] = __fmaf_rn(ds8_1.x * static_cast<float>(dot1), ds1,
+                         __fmaf_rn(-ds8_1.y, mm1, sum[j]));
+
+      if constexpr (has_gate) {
+        const int gdot0 = ggml_hip_dp4a(gv1_0, u1, ggml_hip_dp4a(gv0_0, u0, 0));
+        const int gdot1 = ggml_hip_dp4a(gv1_1, u3, ggml_hip_dp4a(gv0_1, u2, 0));
+        gate_sum[j] = __fmaf_rn(ds8_0.x * static_cast<float>(gdot0), gds0,
+                                __fmaf_rn(-ds8_0.y, gmm0, gate_sum[j]));
+        gate_sum[j] = __fmaf_rn(ds8_1.x * static_cast<float>(gdot1), gds1,
+                                __fmaf_rn(-ds8_1.y, gmm1, gate_sum[j]));
+      }
+    }
+  }
+
+  if constexpr (ncols_dst > 1) {
+    constexpr int shift = 5 - ScatterLevels(ncols_dst);
+    float value = scatter_reduce_sum(sum, lane);
+    float gate_value = 0.0f;
+    if constexpr (has_gate)
+      gate_value = scatter_reduce_sum(gate_sum, lane);
+    const int token = lane >> shift;
+    if ((lane & ((1 << shift) - 1)) == 0 && token < ncols_dst) {
+      value = isfinite(value) ? value : 0.0f;
+      if constexpr (has_gate) {
+        const float g = isfinite(gate_value) ? gate_value : 0.0f;
+        value *= ggml_hip_op_silu_single(g);
+      }
+      output[token * nrows_x + row] = value;
+    }
+    return;
+  }
+
+  sum[0] = warp_reduce_sum<32>(sum[0]);
+  if constexpr (has_gate)
+    gate_sum[0] = warp_reduce_sum<32>(gate_sum[0]);
+  if (lane == 0) {
+    float value = isfinite(sum[0]) ? sum[0] : 0.0f;
+    if constexpr (has_gate) {
+      const float g = isfinite(gate_sum[0]) ? gate_sum[0] : 0.0f;
+      value *= ggml_hip_op_silu_single(g);
+    }
+    output[row] = value;
+  }
+}
+
+template<int ncols_dst>
+static void launch_q4_k_dense(const void* weights, const void* gate,
+                              const block_q8_1* input, float* output, int k,
+                              int rows, int input_stride, hipStream_t stream) {
+  const dim3 grid((rows + 3) / 4);
+  const dim3 block(32, 4);
+  if (gate) {
+    mul_mat_vec_q4_k_dense<ncols_dst, true><<<grid, block, 0, stream>>>(
+        weights, gate, input, output, k, rows, input_stride);
+  } else {
+    mul_mat_vec_q4_k_dense<ncols_dst, false><<<grid, block, 0, stream>>>(
+        weights, nullptr, input, output, k, rows, input_stride);
+  }
+}
+
+void mul_mat_vec_q4_k_dispatch(const void* weights, const void* gate,
+                               const block_q8_1* input, float* output, int k,
+                               int rows, int tokens, int input_stride,
+                               hipStream_t stream) {
+  GGML_ASSERT(k % QK_K == 0 && rows > 0 && tokens > 0);
+  int done = 0;
+  while (done < tokens) {
+    const int n = std::min(8, tokens - done);
+    const block_q8_1* in_ptr = input + size_t(done) * input_stride;
+    float* out_ptr = output + size_t(done) * rows;
+    switch (n) {
+      case 1: launch_q4_k_dense<1>(weights, gate, in_ptr, out_ptr, k, rows, input_stride, stream); break;
+      case 2: launch_q4_k_dense<2>(weights, gate, in_ptr, out_ptr, k, rows, input_stride, stream); break;
+      case 3: launch_q4_k_dense<3>(weights, gate, in_ptr, out_ptr, k, rows, input_stride, stream); break;
+      case 4: launch_q4_k_dense<4>(weights, gate, in_ptr, out_ptr, k, rows, input_stride, stream); break;
+      case 5: launch_q4_k_dense<5>(weights, gate, in_ptr, out_ptr, k, rows, input_stride, stream); break;
+      case 6: launch_q4_k_dense<6>(weights, gate, in_ptr, out_ptr, k, rows, input_stride, stream); break;
+      case 7: launch_q4_k_dense<7>(weights, gate, in_ptr, out_ptr, k, rows, input_stride, stream); break;
+      case 8: launch_q4_k_dense<8>(weights, gate, in_ptr, out_ptr, k, rows, input_stride, stream); break;
+      default: GGML_ABORT("invalid q4_k vector batch width");
+    }
+    done += n;
+  }
+}
+
 template<ggml_type type, int rows_per_wave = 2>
 static void launch_moe(const void* weights, const block_q8_1* input,
                        const int32_t* ids, float* output, int k, int rows,

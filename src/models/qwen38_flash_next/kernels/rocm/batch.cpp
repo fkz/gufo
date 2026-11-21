@@ -722,6 +722,13 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
   if (rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
+  if (w.type == core::GgmlType::kQ4_K) {
+    if (!QuantizeBatch(x, rows, w.cols, error))
+      return false;
+    return qfn_mmq_q4_K_dense_vec_preq(w.data, nullptr, s_.x_q8t, out, w.rows,
+                                       rows, w.cols, stream_) == 0 ||
+           Fail(error, "batched Q4_K projection failed");
+  }
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
               stream_);
@@ -767,17 +774,26 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
   const bool q8 = up.type == core::GgmlType::kQ8_0 &&
                   gate.type == core::GgmlType::kQ8_0 && up.rows == gate.rows &&
                   up.cols == gate.cols;
-  if (q8 && !QuantizeBatch(x, rows, up.cols, error))
+  const bool q4k = up.type == core::GgmlType::kQ4_K &&
+                   gate.type == core::GgmlType::kQ4_K && up.rows == gate.rows &&
+                   up.cols == gate.cols;
+  if ((q8 || q4k) && !QuantizeBatch(x, rows, up.cols, error))
     return false;
   for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
     const auto n = std::min(kDecodeRows, rows - r);
-    if (q8) {
+    if (q8 || q4k) {
       const auto* input = static_cast<const std::uint8_t*>(base.x_q8t) +
                           qfn_mmq_q8_1_bytes(r, up.cols);
-      if (qfn_mmq_q8_0_dense_vec_preq(up.data, gate.data, input,
-                                      out + std::size_t{r} * up.rows, up.rows,
-                                      n, up.cols, stream_) != 0)
-        return Fail(error, "batched gated Q8 projection failed");
+      const int rc =
+          q4k ? qfn_mmq_q4_K_dense_vec_preq(up.data, gate.data, input,
+                                            out + std::size_t{r} * up.rows,
+                                            up.rows, n, up.cols, stream_)
+              : qfn_mmq_q8_0_dense_vec_preq(up.data, gate.data, input,
+                                            out + std::size_t{r} * up.rows,
+                                            up.rows, n, up.cols, stream_);
+      if (rc != 0)
+        return Fail(error, q4k ? "batched gated Q4_K projection failed"
+                               : "batched gated Q8 projection failed");
     } else {
       UseScratch(RowScratch(base, r));
       const bool ok =

@@ -5,6 +5,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace gufo::models::qwen38_flash_next {
 
@@ -54,6 +56,28 @@ inline constexpr float kMtpSampledSubsetMilliseconds[3][8] = {
     {35.2F, 42.9F, 48.9F, 55.1F, 60.9F, 66.5F, 74.4F, 81.5F},
 };
 
+// Measured on AMD Ryzen AI 5 340 w/ Radeon 840M (gfx1152, 4 CUs, DDR5-5600)
+// via qwen38_flash_next_gpu_probe --cost-audit 1 at depths 0 and 4096.
+inline constexpr float kMtpCycleMillisecondsGfx1152C1[3][8] = {
+    {137.2F, 203.2F, 254.9F, 294.8F, 357.4F, 450.3F, 472.8F, 534.6F},
+    {155.0F, 204.6F, 249.8F, 327.4F, 361.8F, 427.8F, 498.7F, 622.5F},
+    {160.0F, 212.0F, 260.0F, 338.0F, 375.0F, 442.0F, 515.0F, 640.0F},
+};
+
+inline constexpr float kMtpSampledSubsetMillisecondsGfx1152[3][8] = {
+    {137.2F, 172.6F, 215.1F, 282.1F, 360.0F, 415.0F, 450.0F, 484.1F},
+    {158.6F, 203.7F, 270.7F, 295.8F, 360.3F, 444.7F, 491.3F, 579.8F},
+    {163.0F, 210.0F, 278.0F, 305.0F, 372.0F, 458.0F, 506.0F, 595.0F},
+};
+
+[[nodiscard]] inline bool UseGfx1152MtpCosts() noexcept {
+  static const bool enabled = []() {
+    const char* v = std::getenv("GUFO_MTP_COSTS");
+    return v != nullptr && std::strcmp(v, "gfx1152") == 0;
+  }();
+  return enabled;
+}
+
 // Seeded sampled policy uses fixed configured capacity for reproducibility;
 // greedy batch policy uses these curves to bootstrap each physical occupancy,
 // and a greedy or unseeded sampled request uses the row for the requests
@@ -73,12 +97,21 @@ inline constexpr float kMtpSampledSubsetMilliseconds[3][8] = {
       interval == 0
           ? static_cast<float>(context) / 4096.0F
           : static_cast<float>(std::min(context, 262144U) - 4096) / 28672.0F;
-  const auto* low_row = sampled_subset && cohort == 0
-                            ? kMtpSampledSubsetMilliseconds[interval]
-                            : kMtpCycleMilliseconds[interval][cohort];
-  const auto* high_row = sampled_subset && cohort == 0
-                             ? kMtpSampledSubsetMilliseconds[interval + 1]
-                             : kMtpCycleMilliseconds[interval + 1][cohort];
+  const bool use_gfx1152 = cohort == 0 && UseGfx1152MtpCosts();
+  const auto* low_row =
+      use_gfx1152
+          ? (sampled_subset ? kMtpSampledSubsetMillisecondsGfx1152[interval]
+                            : kMtpCycleMillisecondsGfx1152C1[interval])
+          : (sampled_subset && cohort == 0
+                 ? kMtpSampledSubsetMilliseconds[interval]
+                 : kMtpCycleMilliseconds[interval][cohort]);
+  const auto* high_row =
+      use_gfx1152
+          ? (sampled_subset ? kMtpSampledSubsetMillisecondsGfx1152[interval + 1]
+                            : kMtpCycleMillisecondsGfx1152C1[interval + 1])
+          : (sampled_subset && cohort == 0
+                 ? kMtpSampledSubsetMilliseconds[interval + 1]
+                 : kMtpCycleMilliseconds[interval + 1][cohort]);
   std::array<float, 8> costs{};
   for (std::size_t i = 0; i < costs.size(); ++i) {
     const auto low = low_row[i];
